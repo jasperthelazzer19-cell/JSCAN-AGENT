@@ -277,7 +277,98 @@ def get_track_record():
     conn.close()
     return stats
 
-def analyze_stock(symbol, price_data, news, previous_calls, positions, track_record=None):
+def news_agent(symbol, name, news):
+    """Agent 1: Analyzes news sentiment and identifies key catalysts."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    news_text = "\n".join([f"- {n['title']} ({n['source']}, {n['published']})" for n in news]) or "No recent news."
+    prompt = f"""You are a financial news analyst. Analyze recent news for {name} ({symbol}).
+
+NEWS:
+{news_text}
+
+Respond in this EXACT format:
+SENTIMENT_SCORE: [number from -10 to +10, where -10 is extremely bearish, 0 is neutral, +10 is extremely bullish]
+KEY_CATALYST: [single most important news item, or "None" if no significant news]
+RISK_FLAG: [any major risks mentioned in news, or "None"]
+SUMMARY: [1 sentence summary of news sentiment]"""
+
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return msg.content[0].text
+
+def technical_agent(symbol, name, price_data):
+    """Agent 2: Analyzes price action and technical indicators."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    price = price_data.get("price", 0)
+    open_p = price_data.get("open", 0)
+    high = price_data.get("high", 0)
+    low = price_data.get("low", 0)
+    volume = price_data.get("volume", 0)
+    change_pct = price_data.get("change_pct", 0)
+
+    # Calculate basic technicals
+    day_range = high - low if high and low else 0
+    range_position = ((price - low) / day_range * 100) if day_range > 0 else 50
+    body_size = abs(price - open_p) / open_p * 100 if open_p else 0
+
+    prompt = f"""You are a technical analyst. Analyze the price action for {name} ({symbol}).
+
+PRICE DATA:
+- Current: ${price} | Change: {change_pct}%
+- Open: ${open_p} | High: ${high} | Low: ${low}
+- Day Range: ${day_range:.2f} | Position in range: {range_position:.0f}%
+- Volume: {volume:,}
+- Candle body size: {body_size:.2f}%
+
+Respond in this EXACT format:
+MOMENTUM: [STRONG_UP / UP / NEUTRAL / DOWN / STRONG_DOWN]
+VOLUME_SIGNAL: [HIGH / NORMAL / LOW]
+RANGE_POSITION: [TOP_THIRD / MIDDLE / BOTTOM_THIRD]
+STRENGTH_SCORE: [number from -10 to +10]
+SUMMARY: [1 sentence technical assessment]"""
+
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return msg.content[0].text
+
+def sentiment_agent(symbol, name, price_data, all_prices):
+    """Agent 3: Analyzes macro environment and sector sentiment."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    # Calculate sector context from all prices
+    changes = [v.get("change_pct", 0) for v in all_prices.values() if v.get("change_pct") is not None]
+    market_avg = round(sum(changes) / len(changes), 2) if changes else 0
+    stock_change = price_data.get("change_pct", 0)
+    vs_market = round(stock_change - market_avg, 2)
+
+    prompt = f"""You are a market sentiment analyst. Assess the broader context for {name} ({symbol}).
+
+MARKET CONTEXT:
+- Stock change today: {stock_change}%
+- Market average change today: {market_avg}%
+- vs Market: {vs_market:+.2f}% (outperforming if positive)
+
+Respond in this EXACT format:
+MARKET_CONDITIONS: [RISK_ON / NEUTRAL / RISK_OFF]
+RELATIVE_STRENGTH: [OUTPERFORMING / IN_LINE / UNDERPERFORMING]
+MACRO_SCORE: [number from -10 to +10]
+SUMMARY: [1 sentence macro/sentiment assessment]"""
+
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return msg.content[0].text
+
+def portfolio_manager(symbol, price_data, news_report, technical_report, sentiment_report, previous_calls, positions, track_record):
+    """Agent 4: Synthesizes all reports and makes final call. Uses Sonnet for better decisions."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     name = STOCK_NAMES.get(symbol, symbol)
 
@@ -288,58 +379,81 @@ def analyze_stock(symbol, price_data, news, previous_calls, positions, track_rec
             price_now = price_data.get("price", 0)
             if price_then and price_now:
                 delta = round(((price_now - price_then) / price_then) * 100, 2)
-                prev_call_text = f"\nPREVIOUS CALL ({pc['date']}): {pc['flag']} at ${price_then}. Since then: {delta:+.2f}%. Thesis was: {pc['thesis']}"
+                prev_call_text = f"\nPREVIOUS CALL ({pc['date']}): {pc['flag']} at ${price_then}. Since then: {delta:+.2f}%."
 
     position_text = ""
     if symbol in positions:
         p = positions[symbol]
-        position_text = f"\nCURRENT PAPER POSITION: {p.get('qty')} shares, avg cost ${p.get('avg_entry_price')}, unrealized P&L: ${p.get('unrealized_pl')}"
-
-    news_text = "\n".join([f"- {n['title']} ({n['source']}, {n['published']})" for n in news]) or "No recent news found."
+        position_text = f"\nCURRENT POSITION: {p.get('qty')} shares, avg ${p.get('avg_entry_price')}, P&L: ${p.get('unrealized_pl')}"
 
     track_text = ""
     if track_record:
         parts = []
         for flag, stats in track_record.items():
             if stats.get("total", 0) >= 5:
-                parts.append(f"{flag}: {stats['accuracy']}% accurate over {stats['total']} calls (7-day)")
+                parts.append(f"{flag}: {stats['accuracy']}% accurate ({stats['total']} calls)")
         if parts:
-            track_text = "\nYOUR HISTORICAL ACCURACY:\n" + "\n".join(parts) + "\nAdjust your confidence accordingly."
+            track_text = "\nYOUR TRACK RECORD: " + " | ".join(parts)
 
-    prompt = f"""You are an elite stock analyst. Analyze {name} ({symbol}) and provide a concise daily briefing.
+    prompt = f"""You are a portfolio manager making a final investment decision for {name} ({symbol}).
 
-PRICE DATA:
-- Current: ${price_data.get('price')}
-- Change: {price_data.get('change_pct')}%
-- High: ${price_data.get('high')} | Low: ${price_data.get('low')}
-- Volume: {price_data.get('volume'):,}
+ANALYST REPORTS:
+NEWS AGENT: {news_report}
+
+TECHNICAL AGENT: {technical_report}
+
+SENTIMENT AGENT: {sentiment_report}
+
+PRICE: ${price_data.get('price')} | Change: {price_data.get('change_pct')}%
 {prev_call_text}
 {position_text}
 {track_text}
 
-RECENT NEWS:
-{news_text}
+Based on ALL three analyst reports, make your final decision.
+Be decisive — only use YELLOW if reports genuinely conflict. GREEN or RED when 2+ agents agree.
 
-Provide your analysis in this EXACT format:
-
+Respond in this EXACT format:
 FLAG: [GREEN / YELLOW / RED]
 BULL CASE: [1-2 sentences]
 BEAR CASE: [1-2 sentences]
-VERDICT: [1-2 sentences with your call]
-ACTION: [BUY / HOLD / SELL / WATCH] [optional: qty for paper trade e.g. "BUY 5 shares"]
+VERDICT: [1-2 sentences — your final call with conviction]
+ACTION: [BUY / HOLD / SELL / WATCH] [optional qty e.g. "BUY 5 shares"]
+CONFIDENCE: [HIGH / MEDIUM / LOW]"""
 
-Be direct, specific, and confident. No fluff."""
-
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=400,
+    msg = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
-    return message.content[0].text
+    return msg.content[0].text
+
+def analyze_stock(symbol, price_data, news, previous_calls, positions, track_record=None, all_prices=None):
+    """Multi-agent analysis: runs 4 specialized agents then synthesizes."""
+    name = STOCK_NAMES.get(symbol, symbol)
+    if all_prices is None:
+        all_prices = {symbol: price_data}
+
+    try:
+        news_report = news_agent(symbol, name, news)
+    except Exception as e:
+        news_report = f"SENTIMENT_SCORE: 0\nKEY_CATALYST: None\nRISK_FLAG: None\nSUMMARY: News analysis unavailable."
+
+    try:
+        tech_report = technical_agent(symbol, name, price_data)
+    except Exception as e:
+        tech_report = f"MOMENTUM: NEUTRAL\nVOLUME_SIGNAL: NORMAL\nRANGE_POSITION: MIDDLE\nSTRENGTH_SCORE: 0\nSUMMARY: Technical analysis unavailable."
+
+    try:
+        sent_report = sentiment_agent(symbol, name, price_data, all_prices)
+    except Exception as e:
+        sent_report = f"MARKET_CONDITIONS: NEUTRAL\nRELATIVE_STRENGTH: IN_LINE\nMACRO_SCORE: 0\nSUMMARY: Sentiment analysis unavailable."
+
+    final = portfolio_manager(symbol, price_data, news_report, tech_report, sent_report, previous_calls, positions, track_record or {})
+    return final
 
 def parse_analysis(text):
     lines = text.strip().split("\n")
-    result = {"flag": "YELLOW", "bull": "", "bear": "", "verdict": "", "action": "WATCH", "raw": text}
+    result = {"flag": "YELLOW", "bull": "", "bear": "", "verdict": "", "action": "WATCH", "confidence": "MEDIUM", "raw": text}
     for line in lines:
         if line.startswith("FLAG:"):
             raw = line.replace("FLAG:", "").strip().upper()
@@ -354,6 +468,8 @@ def parse_analysis(text):
             result["verdict"] = line.replace("VERDICT:", "").strip()
         elif line.startswith("ACTION:"):
             result["action"] = line.replace("ACTION:", "").strip()
+        elif line.startswith("CONFIDENCE:"):
+            result["confidence"] = line.replace("CONFIDENCE:", "").strip()
     return result
 
 # ─── EMAIL BUILDER ────────────────────────────────────────
@@ -481,7 +597,7 @@ def run_agent(symbols=None):
         pd = price_data[sym]
         news = get_news(sym, STOCK_NAMES.get(sym, sym))
         try:
-            raw = analyze_stock(sym, pd, news, previous_calls, positions, track_record)
+            raw = analyze_stock(sym, pd, news, previous_calls, positions, track_record, price_data)
             parsed = parse_analysis(raw)
             parsed["symbol"] = sym
             parsed["name"] = STOCK_NAMES.get(sym, sym)
