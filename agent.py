@@ -702,6 +702,226 @@ def status():
         "track_record": track_record
     })
 
+@app.route("/dashboard")
+def dashboard():
+    # Get all data
+    conn = sqlite3.connect("agent.db")
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM subscribers WHERE active=1")
+    subs = c.fetchone()[0]
+    c.execute("""
+        SELECT ca.symbol, ca.date, ca.flag, ca.price, ca.thesis,
+               cr.price_change_pct, cr.outcome, cr.days_later
+        FROM calls ca
+        LEFT JOIN call_results cr ON ca.id = cr.call_id AND cr.days_later = 1
+        ORDER BY ca.created_at DESC LIMIT 100
+    """)
+    rows = c.fetchall()
+    calls = [{"symbol": r[0], "date": r[1], "flag": r[2], "price": r[3],
+              "thesis": r[4], "change_pct": r[5], "outcome": r[6], "days": r[7]} for r in rows]
+
+    # Best and worst calls
+    scored = [c for c in calls if c["change_pct"] is not None]
+    best = sorted(scored, key=lambda x: x["change_pct"] or 0, reverse=True)[:5]
+    worst = sorted(scored, key=lambda x: x["change_pct"] or 0)[:5]
+
+    conn.close()
+    account = get_alpaca_account()
+    track_record = get_track_record()
+    positions = get_alpaca_positions()
+
+    portfolio_val = account.get("portfolio_value", 0)
+    cash = account.get("cash", 0)
+
+    def flag_color(f):
+        return {"GREEN": "#00ff88", "YELLOW": "#f0c040", "RED": "#ff4444"}.get(f, "#888")
+
+    def outcome_badge(o):
+        if o == "correct": return '<span style="color:#00ff88;font-weight:600">✓ Correct</span>'
+        if o == "incorrect": return '<span style="color:#ff4444;font-weight:600">✗ Wrong</span>'
+        return '<span style="color:#555">— Pending</span>'
+
+    # Build track record section
+    tr_html = ""
+    if track_record:
+        for flag, stats in track_record.items():
+            fc = flag_color(flag)
+            bar_width = stats["accuracy"]
+            tr_html += f"""
+            <div style="margin-bottom:16px">
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+                    <span style="color:{fc};font-weight:700">{flag}</span>
+                    <span style="color:#fff;font-weight:600">{stats['accuracy']}% accurate</span>
+                </div>
+                <div style="background:#1a1a1a;border-radius:4px;height:8px;overflow:hidden">
+                    <div style="background:{fc};height:100%;width:{bar_width}%;transition:width .5s"></div>
+                </div>
+                <div style="color:#444;font-size:.75em;margin-top:4px">{stats['correct']} correct out of {stats['total']} calls (7-day)</div>
+            </div>"""
+    else:
+        tr_html = '<div style="color:#444;font-size:.88em">No track record yet — needs 7 days of data</div>'
+
+    # Build calls table
+    calls_html = ""
+    for call in calls[:50]:
+        fc = flag_color(call["flag"])
+        chg = call["change_pct"]
+        chg_str = f'+{chg:.2f}%' if chg and chg >= 0 else f'{chg:.2f}%' if chg else '—'
+        chg_color = "#00ff88" if chg and chg >= 0 else "#ff4444" if chg else "#555"
+        calls_html += f"""
+        <tr style="border-bottom:1px solid #111">
+            <td style="padding:10px 16px;color:#fff;font-weight:700">{call['symbol']}</td>
+            <td style="padding:10px 16px;color:#555;font-size:.85em">{call['date']}</td>
+            <td style="padding:10px 16px;color:{fc};font-weight:700">{call['flag']}</td>
+            <td style="padding:10px 16px;color:#aaa">${call['price']}</td>
+            <td style="padding:10px 16px;color:{chg_color};font-weight:600">{chg_str}</td>
+            <td style="padding:10px 16px">{outcome_badge(call['outcome'])}</td>
+            <td style="padding:10px 16px;color:#555;font-size:.8em;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{call['thesis'] or '—'}</td>
+        </tr>"""
+
+    # Positions
+    pos_html = ""
+    if positions:
+        for sym, p in positions.items():
+            pl = float(p.get("unrealized_pl", 0))
+            pl_color = "#00ff88" if pl >= 0 else "#ff4444"
+            pl_str = f'+${pl:.2f}' if pl >= 0 else f'-${abs(pl):.2f}'
+            pos_html += f"""
+            <tr style="border-bottom:1px solid #111">
+                <td style="padding:10px 16px;color:#fff;font-weight:700">{sym}</td>
+                <td style="padding:10px 16px;color:#aaa">{p.get('qty')} shares</td>
+                <td style="padding:10px 16px;color:#aaa">${float(p.get('avg_entry_price',0)):.2f}</td>
+                <td style="padding:10px 16px;color:#aaa">${float(p.get('current_price',0)):.2f}</td>
+                <td style="padding:10px 16px;color:{pl_color};font-weight:600">{pl_str}</td>
+            </tr>"""
+    else:
+        pos_html = '<tr><td colspan="5" style="padding:20px 16px;color:#444;text-align:center">No open positions</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<title>JSCAN Agent Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Inter',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh}}
+.header{{padding:20px 40px;border-bottom:1px solid #1c1c1c;display:flex;align-items:center;justify-content:space-between;background:#050505}}
+.logo{{font-size:1.4em;font-weight:700;color:#00ff88}}
+.logo span{{color:#fff}}
+.nav a{{color:#555;text-decoration:none;font-size:.85em;margin-left:20px;transition:color .2s}}
+.nav a:hover{{color:#00ff88}}
+.container{{padding:32px 40px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:28px}}
+.stat-card{{background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;padding:18px 20px}}
+.stat-label{{font-size:.7em;color:#444;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}}
+.stat-value{{font-size:1.6em;font-weight:700;color:#00ff88}}
+.section{{background:#0d0d0d;border:1px solid #1c1c1c;border-radius:12px;margin-bottom:20px;overflow:hidden}}
+.section-header{{padding:16px 20px;border-bottom:1px solid #141414;font-size:.8em;color:#555;text-transform:uppercase;letter-spacing:.8px;font-weight:600}}
+.section-body{{padding:20px}}
+table{{width:100%;border-collapse:collapse}}
+th{{padding:10px 16px;text-align:left;font-size:.68em;color:#444;text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid #141414}}
+.run-btn{{background:#00ff88;color:#000;border:none;padding:10px 20px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.88em;transition:opacity .2s}}
+.run-btn:hover{{opacity:.85}}
+.run-btn:disabled{{opacity:.5;cursor:not-allowed}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">J<span>SCAN</span> <span style="color:#555;font-size:.65em;font-weight:400;margin-left:8px">Agent Dashboard</span></div>
+  <div class="nav">
+    <a href="/">Signup</a>
+    <a href="https://jscan-production.up.railway.app" target="_blank">JSCAN ↗</a>
+    <button class="run-btn" id="run-btn" onclick="triggerRun()">▶ Run Now</button>
+  </div>
+</div>
+<div class="container">
+
+  <!-- Stats -->
+  <div class="grid">
+    <div class="stat-card">
+      <div class="stat-label">Portfolio Value</div>
+      <div class="stat-value">${float(portfolio_val):,.0f}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Cash</div>
+      <div class="stat-value" style="color:#e0e0e0">${float(cash):,.0f}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Subscribers</div>
+      <div class="stat-value" style="color:#e0e0e0">{subs}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Calls</div>
+      <div class="stat-value" style="color:#e0e0e0">{len(calls)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Scored Calls</div>
+      <div class="stat-value" style="color:#e0e0e0">{len(scored)}</div>
+    </div>
+  </div>
+
+  <!-- Track Record -->
+  <div class="section">
+    <div class="section-header">🎯 Track Record (7-day accuracy)</div>
+    <div class="section-body">{tr_html}</div>
+  </div>
+
+  <!-- Best/Worst -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">
+    <div class="section">
+      <div class="section-header">🟢 Best Calls</div>
+      <div class="section-body">
+        {''.join([f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #111"><span style="color:#fff;font-weight:600">{b["symbol"]}</span><span style="color:#00ff88;font-weight:600">+{b["change_pct"]:.2f}%</span></div>' for b in best]) or '<div style="color:#444">No data yet</div>'}
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-header">🔴 Worst Calls</div>
+      <div class="section-body">
+        {''.join([f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #111"><span style="color:#fff;font-weight:600">{w["symbol"]}</span><span style="color:#ff4444;font-weight:600">{w["change_pct"]:.2f}%</span></div>' for w in worst]) or '<div style="color:#444">No data yet</div>'}
+      </div>
+    </div>
+  </div>
+
+  <!-- Positions -->
+  <div class="section">
+    <div class="section-header">📈 Paper Positions</div>
+    <table>
+      <tr><th>Symbol</th><th>Quantity</th><th>Avg Cost</th><th>Current</th><th>P&L</th></tr>
+      {pos_html}
+    </table>
+  </div>
+
+  <!-- Recent Calls -->
+  <div class="section">
+    <div class="section-header">📋 Recent Calls (last 50)</div>
+    <div style="overflow-x:auto">
+      <table>
+        <tr><th>Symbol</th><th>Date</th><th>Flag</th><th>Price</th><th>1d Change</th><th>Outcome</th><th>Thesis</th></tr>
+        {calls_html}
+      </table>
+    </div>
+  </div>
+
+</div>
+<script>
+function triggerRun(){{
+  var btn=document.getElementById('run-btn');
+  btn.disabled=true;
+  btn.textContent='Running...';
+  fetch('/run',{{method:'POST'}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      btn.textContent='✓ Done — '+d.analyzed+' stocks';
+      setTimeout(function(){{location.reload();}},2000);
+    }})
+    .catch(function(){{btn.textContent='Error';btn.disabled=false;}});
+}}
+</script>
+</body>
+</html>"""
+    return html
+
 if __name__ == "__main__":
     init_db()
     print("JSCAN Agent starting...")
