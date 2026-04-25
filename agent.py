@@ -570,7 +570,11 @@ def build_email(analyses, account):
     return html
 
 # ─── MAIN AGENT RUN ───────────────────────────────────────
-def run_agent(symbols=None):
+def run_agent(symbols=None, force=False):
+    # Skip weekends unless forced (manual run from dashboard)
+    if not force and datetime.now().weekday() >= 5:
+        print(f"[{datetime.now()}] Skipping — weekend, markets closed.")
+        return []
     if symbols is None:
         symbols = WATCHLIST
     print(f"[{datetime.now()}] Agent running for {len(symbols)} stocks...")
@@ -796,7 +800,7 @@ def subscribe():
 
 @app.route("/run", methods=["POST"])
 def trigger_run():
-    analyses = run_agent()
+    analyses = run_agent(force=True)
     return jsonify({"success": True, "analyzed": len(analyses)})
 
 @app.route("/status")
