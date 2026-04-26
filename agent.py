@@ -19,6 +19,12 @@ ALPACA_KEY      = os.environ.get("ALPACA_KEY", "")
 ALPACA_SECRET   = os.environ.get("ALPACA_SECRET", "")
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 FROM_EMAIL      = os.environ.get("FROM_EMAIL", "")
+X_API_KEY       = os.environ.get("X_API_KEY", "")
+X_API_SECRET    = os.environ.get("X_API_SECRET", "")
+X_ACCESS_TOKEN  = os.environ.get("X_ACCESS_TOKEN", "")
+X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
+DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "")
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
 WATCHLIST = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","JPM","V",
@@ -569,6 +575,83 @@ def build_email(analyses, account):
 </html>"""
     return html
 
+
+def build_free_email(analyses, account):
+    today = datetime.now().strftime("%A, %B %d, %Y")
+    green = [a for a in analyses if a["flag"] == "GREEN"]
+    red = [a for a in analyses if a["flag"] == "RED"]
+    yellow = [a for a in analyses if a["flag"] == "YELLOW"]
+
+    def flag_color(f):
+        return {"GREEN": "#00cc66", "YELLOW": "#f0c040", "RED": "#ff4444"}.get(f, "#888")
+
+    def flag_emoji(f):
+        return {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(f, "⚪")
+
+    rows = ""
+    for a in analyses:
+        fc = flag_color(a["flag"])
+        fe = flag_emoji(a["flag"])
+        chg = a.get("change_pct", 0)
+        chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+        chg_color = "#00cc66" if chg >= 0 else "#ff4444"
+        rows += f"""
+        <tr style="border-bottom:1px solid #1a1a1a">
+          <td style="padding:14px 16px;font-weight:700;color:#fff;font-size:15px">{fe} {a['symbol']}</td>
+          <td style="padding:14px 16px;color:#aaa;font-size:13px">{a['name']}</td>
+          <td style="padding:14px 16px;color:#fff;font-weight:600">${a['price']}</td>
+          <td style="padding:14px 16px;color:{chg_color};font-weight:600">{chg_str}</td>
+          <td style="padding:14px 16px;color:{fc};font-weight:700;font-size:13px">{a['flag']}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:600px;margin:0 auto;padding:24px 16px">
+    <div style="text-align:center;margin-bottom:28px">
+      <div style="font-size:28px;font-weight:800;color:#00ff88;letter-spacing:-1px">JSCAN</div>
+      <div style="color:#555;font-size:13px;margin-top:4px">Daily Brief (Free) — {today}</div>
+    </div>
+
+    <div style="background:#111;border:1px solid #1c1c1c;border-radius:12px;padding:16px;margin-bottom:20px;text-align:center">
+      <div style="color:#888;font-size:12px;margin-bottom:8px">TOP SIGNALS TODAY</div>
+      <div style="display:flex;justify-content:center;gap:24px">
+        <div><span style="font-size:20px;font-weight:700;color:#00cc66">{len(green)}</span><span style="font-size:18px"> 🟢</span></div>
+        <div><span style="font-size:20px;font-weight:700;color:#f0c040">{len(yellow)}</span><span style="font-size:18px"> 🟡</span></div>
+        <div><span style="font-size:20px;font-weight:700;color:#ff4444">{len(red)}</span><span style="font-size:18px"> 🔴</span></div>
+      </div>
+    </div>
+
+    <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:12px;overflow:hidden;margin-bottom:20px">
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="background:#111;border-bottom:1px solid #1c1c1c">
+            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Symbol</th>
+            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Name</th>
+            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Price</th>
+            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Change</th>
+            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Signal</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+
+    <div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:20px">
+      <div style="color:#00cc66;font-weight:700;font-size:15px;margin-bottom:8px">Want full analysis + thesis for all 100 stocks?</div>
+      <div style="color:#888;font-size:13px;margin-bottom:16px">Upgrade to see why each signal was called, sector breakdowns, and full AI reasoning.</div>
+      <a href="https://jscan-agent.up.railway.app" style="background:#00ff88;color:#000;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">Upgrade — $5/month</a>
+    </div>
+
+    <div style="text-align:center;color:#333;font-size:12px">
+      JSCAN AI Agent · Paper trading only · Not financial advice
+    </div>
+  </div>
+</body>
+</html>"""
+    return html
+
 # ─── MAIN AGENT RUN ───────────────────────────────────────
 def run_agent(symbols=None, force=False):
     # Skip weekends unless forced (manual run from dashboard)
@@ -636,24 +719,43 @@ def run_agent(symbols=None, force=False):
     # Send to all active subscribers
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    c.execute("SELECT email, stocks FROM subscribers WHERE active=1")
+    # Add paid column if it doesn't exist
+    try:
+        c.execute("ALTER TABLE subscribers ADD COLUMN paid INTEGER DEFAULT 0")
+        conn.commit()
+    except:
+        pass
+    c.execute("SELECT email, stocks, paid FROM subscribers WHERE active=1")
     subscribers = c.fetchall()
     conn.close()
 
-    email_html = build_email(analyses, account)
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_KEY)
 
-    for email, stocks_json in subscribers:
+    for email, stocks_json, paid in subscribers:
         try:
             user_stocks = json.loads(stocks_json)
             user_analyses = [a for a in analyses if a["symbol"] in user_stocks] if user_stocks != ["ALL"] else analyses
             if not user_analyses:
                 continue
-            user_html = build_email(user_analyses, account)
+
+            # Free tier: top 8 signals only, no thesis
+            if not paid:
+                # Take top 8: greens first, then reds, then yellows
+                greens = [a for a in user_analyses if a["flag"] == "GREEN"][:3]
+                reds = [a for a in user_analyses if a["flag"] == "RED"][:3]
+                yellows = [a for a in user_analyses if a["flag"] == "YELLOW"][:2]
+                free_analyses = greens + reds + yellows
+                # Strip thesis for free tier
+                for a in free_analyses:
+                    a = dict(a)
+                user_html = build_free_email(free_analyses, account)
+            else:
+                user_html = build_email(user_analyses, account)
+
             message = Mail(
                 from_email=FROM_EMAIL,
                 to_emails=email,
-                subject=f"📊 JSCAN Daily Brief — {datetime.now().strftime('%b %d')} | {len([a for a in user_analyses if a['flag']=='GREEN'])}🟢 {len([a for a in user_analyses if a['flag']=='RED'])}🔴",
+                subject=f"JSCAN Daily Brief - {datetime.now().strftime('%b %d')} | {len([a for a in user_analyses if a['flag']=='GREEN'])} GREEN {len([a for a in user_analyses if a['flag']=='RED'])} RED",
                 html_content=user_html
             )
             sg.send(message)
@@ -662,7 +764,158 @@ def run_agent(symbols=None, force=False):
             print(f"  Email error for {email}: {e}")
 
     print(f"[{datetime.now()}] Agent done. Analyzed {len(analyses)} stocks.")
+    run_marketing(analyses)
     return analyses
+
+# ─── MARKETING AGENT ──────────────────────────────────────
+def post_to_x(text):
+    if not X_API_KEY or not X_ACCESS_TOKEN:
+        print("  X keys not configured, skipping")
+        return False
+    try:
+        import tweepy
+        client = tweepy.Client(
+            consumer_key=X_API_KEY,
+            consumer_secret=X_API_SECRET,
+            access_token=X_ACCESS_TOKEN,
+            access_token_secret=X_ACCESS_TOKEN_SECRET
+        )
+        client.create_tweet(text=text[:280])
+        print(f"  X tweet posted: {text[:60]}...")
+        return True
+    except Exception as e:
+        print(f"  X post failed: {e}")
+        return False
+
+def post_to_discord(text):
+    if not DISCORD_TOKEN or not DISCORD_CHANNEL_ID:
+        print("  Discord not configured, skipping")
+        return False
+    try:
+        headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
+        payload = {"content": text}
+        r = requests.post(f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+                         headers=headers, json=payload, timeout=10)
+        if r.status_code == 200:
+            print(f"  Discord message posted")
+            return True
+        else:
+            print(f"  Discord failed: {r.status_code} {r.text}")
+            return False
+    except Exception as e:
+        print(f"  Discord post failed: {e}")
+        return False
+
+def generate_marketing_post(analyses, with_link=False):
+    if not analyses:
+        return None
+    greens = [a for a in analyses if a["flag"] == "GREEN"]
+    reds = [a for a in analyses if a["flag"] == "RED"]
+    best = greens[0] if greens else (reds[0] if reds else analyses[0])
+    flag = best["flag"]
+    green_count = len(greens)
+    red_count = len(reds)
+
+    try:
+        conn = sqlite3.connect("agent.db")
+        c = conn.cursor()
+        c.execute("SELECT ca.flag, cr.outcome FROM calls ca JOIN call_results cr ON ca.id = cr.call_id WHERE cr.days_later = 1 ORDER BY ca.created_at DESC LIMIT 50")
+        rows = c.fetchall()
+        conn.close()
+        if rows:
+            correct = sum(1 for r in rows if r[1] == "correct")
+            accuracy_line = f"{round(correct/len(rows)*100)}% accuracy over {len(rows)} calls."
+        else:
+            accuracy_line = "Just launched - first week of tracking."
+    except:
+        accuracy_line = "AI-powered stock research agent."
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    if with_link:
+        prompt = f"""Write a compelling tweet about this AI stock signal. Include the signup URL as plain text.
+
+Signal: {best['symbol']} flagged {flag} at ${best['price']}
+Thesis: {best.get('thesis','')[:120]}
+Today: {green_count} GREEN, {red_count} RED out of {len(analyses)} stocks analyzed
+{accuracy_line}
+URL: jscan-agent.up.railway.app
+
+Rules:
+- Max 255 chars total
+- Sound like a real trader not a bot
+- Include jscan-agent.up.railway.app as plain text
+- Max 2 hashtags
+- Be specific about the signal"""
+    else:
+        prompt = f"""Write a short punchy tweet about this AI stock signal. No links.
+
+Signal: {best['symbol']} flagged {flag} at ${best['price']}
+Thesis: {best.get('thesis','')[:120]}
+Today: {green_count} GREEN, {red_count} RED out of {len(analyses)} stocks analyzed
+{accuracy_line}
+
+Rules:
+- Max 240 chars
+- Sound like a real trader not a bot
+- NO links or URLs
+- Max 2 hashtags (#stocks #algotrading)
+- Mention JSCAN naturally
+- Be specific and interesting"""
+
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return msg.content[0].text.strip()
+
+def generate_discord_post(analyses):
+    if not analyses:
+        return None
+    greens = [a for a in analyses if a["flag"] == "GREEN"]
+    reds = [a for a in analyses if a["flag"] == "RED"]
+    yellows = [a for a in analyses if a["flag"] == "YELLOW"]
+    today = datetime.now().strftime("%B %d, %Y")
+    msg = f"**JSCAN Daily Signals - {today}**\n\n"
+    msg += f"Analyzed **{len(analyses)} stocks** today\n"
+    msg += f"**{len(greens)} GREEN** | {len(yellows)} YELLOW | **{len(reds)} RED**\n\n"
+    if greens:
+        msg += "**TOP BULLISH SIGNALS:**\n"
+        for c in greens[:3]:
+            msg += f"🟢 **{c['symbol']}** @ ${c['price']} — {c.get('thesis','')[:80]}...\n"
+    if reds:
+        msg += "\n**TOP BEARISH SIGNALS:**\n"
+        for c in reds[:3]:
+            msg += f"🔴 **{c['symbol']}** @ ${c['price']} — {c.get('thesis','')[:80]}...\n"
+    msg += f"\nFull analysis + signup: jscan-agent.up.railway.app"
+    return msg
+
+def run_marketing(analyses):
+    print(f"[{datetime.now()}] Running marketing agent...")
+    if not analyses:
+        print("  No analyses to market")
+        return
+
+    # Discord - full daily summary (free)
+    discord_msg = generate_discord_post(analyses)
+    if discord_msg:
+        post_to_discord(discord_msg)
+
+    # X - 1 link post
+    link_tweet = generate_marketing_post(analyses, with_link=True)
+    if link_tweet:
+        post_to_x(link_tweet)
+        time.sleep(60)
+
+    # X - 4 plain text posts spaced 15 mins apart
+    for i in range(4):
+        plain_tweet = generate_marketing_post(analyses, with_link=False)
+        if plain_tweet:
+            post_to_x(plain_tweet)
+            if i < 3:
+                time.sleep(900)
+
+    print(f"[{datetime.now()}] Marketing done.")
 
 # ─── FLASK SIGNUP PAGE ────────────────────────────────────
 SIGNUP_HTML = """<!DOCTYPE html>
