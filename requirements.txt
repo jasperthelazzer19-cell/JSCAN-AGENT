@@ -3,3 +3,4 @@ requests
 anthropic
 sendgrid
 schedule
+tweepy
