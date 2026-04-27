@@ -855,6 +855,13 @@ def run_agent(symbols=None, force=False):
     positions = get_alpaca_positions()
     account = get_alpaca_account()
     previous_calls = get_previous_calls()
+    portfolio_val = float(account.get("portfolio_value", 0))
+
+    # Pre-calculate budget (will be divided by GREEN signals after analysis)
+    # For now use a reasonable default, recalculate after we know green count
+    budget_remaining = get_weekly_budget_remaining()
+    per_position = round(budget_remaining / 10, 2)  # assume ~10 green signals initially
+    total_deployed = 0
 
     # Score past calls and get track record for self-improvement
     print("  Scoring past calls...")
@@ -911,16 +918,11 @@ def run_agent(symbols=None, force=False):
             print(f"  Error analyzing {sym}: {e}")
         time.sleep(0.5)  # avoid rate limiting
 
-    # Calculate position size based on weekly budget
+    # Recalculate per_position now that we know actual green count
     green_signals = [a for a in analyses if a["flag"] == "GREEN"]
-    budget_remaining = get_weekly_budget_remaining()
-    per_position = round(budget_remaining / max(len(green_signals), 1), 2) if green_signals else 0
+    if green_signals:
+        per_position = round(budget_remaining / max(len(green_signals), 1), 2)
     print(f"  Weekly budget remaining: ${budget_remaining:,.0f} | Per position: ${per_position:,.0f} | GREEN signals: {len(green_signals)}")
-
-    # Execute paper trades
-    account = get_alpaca_account()
-    portfolio_val = float(account.get("portfolio_value", 0))
-    total_deployed = 0
 
     if total_deployed > 0:
         print(f"  Total deployed this session: ${total_deployed:,.0f}")
