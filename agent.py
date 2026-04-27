@@ -1476,7 +1476,7 @@ if __name__ == "__main__":
     print("Status: http://127.0.0.1:5001/status")
 
     # Schedule daily run at 8am
-    schedule.every().day.at("08:00").do(run_agent)
+    schedule.every().day.at("15:00").do(run_agent)  # 8am PDT = 15:00 UTC
 
     import threading
     def run_schedule():
