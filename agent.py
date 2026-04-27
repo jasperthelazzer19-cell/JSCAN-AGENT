@@ -179,7 +179,51 @@ def get_alpaca_account():
     except:
         return {}
 
-def place_paper_trade(symbol, side, qty):
+WEEKLY_BUDGET = 10000  # $10k paper money per week
+
+def get_weekly_budget_remaining():
+    """Track how much of this week's budget has been deployed."""
+    conn = sqlite3.connect("agent.db")
+    c = conn.cursor()
+    # Create budget table if not exists
+    c.execute("""CREATE TABLE IF NOT EXISTS weekly_budget (
+        week TEXT PRIMARY KEY,
+        deployed REAL DEFAULT 0,
+        starting_value REAL DEFAULT 0,
+        current_value REAL DEFAULT 0
+    )""")
+    conn.commit()
+    week = datetime.now().strftime("%Y-W%W")
+    c.execute("SELECT deployed FROM weekly_budget WHERE week = ?", (week,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return WEEKLY_BUDGET
+    return max(0, WEEKLY_BUDGET - row[0])
+
+def record_budget_deployment(amount, portfolio_value):
+    """Record money deployed this week."""
+    conn = sqlite3.connect("agent.db")
+    c = conn.cursor()
+    week = datetime.now().strftime("%Y-W%W")
+    c.execute("""INSERT INTO weekly_budget (week, deployed, starting_value, current_value)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(week) DO UPDATE SET
+        deployed = deployed + ?,
+        current_value = ?
+    """, (week, amount, portfolio_value, portfolio_value, amount, portfolio_value))
+    conn.commit()
+    conn.close()
+
+def get_portfolio_history():
+    """Get weekly portfolio performance for display."""
+    conn = sqlite3.connect("agent.db")
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS weekly_budget (week TEXT PRIMARY KEY, deployed REAL DEFAULT 0, starting_value REAL DEFAULT 0, current_value REAL DEFAULT 0)")
+    c.execute("SELECT week, deployed, starting_value, current_value FROM weekly_budget ORDER BY week DESC LIMIT 12")
+    rows = c.fetchall()
+    conn.close()
+    return [{"week": r[0], "deployed": r[1], "starting": r[2], "current": r[3]} for r in rows]
     try:
         r = requests.post(
             f"{ALPACA_BASE_URL}/v2/orders",
@@ -806,16 +850,20 @@ def run_agent(symbols=None, force=False):
             analyses.append(parsed)
             save_call(sym, parsed["flag"], pd["price"], parsed["verdict"])
 
-            # Paper trade if Claude says BUY or SELL
+            # Paper trade if Claude says BUY or SELL — budget based sizing
             action = parsed["action"].upper()
-            if "BUY" in action:
-                qty = 1
-                for word in action.split():
-                    if word.isdigit():
-                        qty = int(word)
-                        break
-                result = place_paper_trade(sym, "buy", qty)
-                print(f"    Paper BUY {qty}x {sym}: {result.get('status', result.get('error', 'unknown'))}")
+            if "BUY" in action and parsed["flag"] == "GREEN":
+                price = pd["price"]
+                if price and price > 0:
+                    # Calculate shares based on budget allocation
+                    budget_per = min(per_position, get_weekly_budget_remaining())
+                    qty = max(1, int(budget_per / price))
+                    cost = round(qty * price, 2)
+                    result = place_paper_trade(sym, "buy", qty)
+                    if "error" not in result:
+                        record_budget_deployment(cost, portfolio_val)
+                        total_deployed += cost
+                    print(f"    Paper BUY {qty}x {sym} @ ${price} = ${cost}: {result.get('status', result.get('error', 'unknown'))}")
             elif "SELL" in action and sym in positions:
                 qty = positions[sym].get("qty", 1)
                 result = place_paper_trade(sym, "sell", qty)
@@ -825,11 +873,20 @@ def run_agent(symbols=None, force=False):
             print(f"  Error analyzing {sym}: {e}")
         time.sleep(0.5)  # avoid rate limiting
 
-    # Sort: green first, then yellow, then red
-    order = {"GREEN": 0, "YELLOW": 1, "RED": 2}
-    analyses.sort(key=lambda x: order.get(x["flag"], 1))
+    # Calculate position size based on weekly budget
+    green_signals = [a for a in analyses if a["flag"] == "GREEN"]
+    budget_remaining = get_weekly_budget_remaining()
+    per_position = round(budget_remaining / max(len(green_signals), 1), 2) if green_signals else 0
+    print(f"  Weekly budget remaining: ${budget_remaining:,.0f} | Per position: ${per_position:,.0f} | GREEN signals: {len(green_signals)}")
 
-    # Send to all active subscribers
+    # Execute paper trades
+    account = get_alpaca_account()
+    portfolio_val = float(account.get("portfolio_value", 0))
+    total_deployed = 0
+
+    if total_deployed > 0:
+        print(f"  Total deployed this session: ${total_deployed:,.0f}")
+
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
     # Add paid column if it doesn't exist
