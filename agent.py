@@ -268,19 +268,45 @@ def get_track_record():
     stats = {}
     for flag in ["GREEN", "RED", "YELLOW"]:
         c.execute("""
-            SELECT outcome, COUNT(*) FROM call_results cr
+            SELECT outcome, COUNT(*), AVG(ABS(price_change_pct)) FROM call_results cr
             JOIN calls ca ON cr.call_id = ca.id
-            WHERE ca.flag = ? AND cr.days_later = 7
+            WHERE ca.flag = ? AND cr.days_later = 1
             GROUP BY outcome
         """, (flag,))
+        rows = c.fetchall()
+        total = sum(r[1] for r in rows)
+        if total > 0:
+            correct = sum(r[1] for r in rows if r[0] == "correct")
+            avg_move = round(sum(r[2]*r[1] for r in rows if r[2]) / total, 2) if rows else 0
+            accuracy = round((correct / total) * 100, 1)
+            stats[flag] = {"accuracy": accuracy, "total": total, "correct": correct, "avg_move": avg_move}
+
+    # Sector-level accuracy
+    sector_stats = {}
+    sectors = {
+        "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
+        "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP","SPGI"],
+        "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","PFE","BMY","GILD","AMGN","MDT","BSX","SYK","ZTS"],
+        "ENERGY": ["XOM","CVX","COP","PSX","VLO","MPC","HES","DVN","FANG","OXY","SLB","HAL"],
+        "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","TGT","NKE","SBUX","DIS","NFLX"]
+    }
+    for sector, syms in sectors.items():
+        placeholders = ",".join("?" * len(syms))
+        c.execute(f"""
+            SELECT outcome, COUNT(*) FROM call_results cr
+            JOIN calls ca ON cr.call_id = ca.id
+            WHERE ca.symbol IN ({placeholders}) AND cr.days_later = 1 AND ca.flag = 'GREEN'
+            GROUP BY outcome
+        """, syms)
         rows = dict(c.fetchall())
         total = sum(rows.values())
-        if total > 0:
+        if total >= 3:
             correct = rows.get("correct", 0)
-            accuracy = round((correct / total) * 100, 1)
-            stats[flag] = {"accuracy": accuracy, "total": total, "correct": correct}
+            sector_stats[sector] = round((correct / total) * 100, 1)
 
     conn.close()
+    if sector_stats:
+        stats["sectors"] = sector_stats
     return stats
 
 def news_agent(symbol, name, news):
@@ -395,11 +421,36 @@ def portfolio_manager(symbol, price_data, news_report, technical_report, sentime
     track_text = ""
     if track_record:
         parts = []
-        for flag, stats in track_record.items():
-            if stats.get("total", 0) >= 5:
-                parts.append(f"{flag}: {stats['accuracy']}% accurate ({stats['total']} calls)")
+        for flag in ["GREEN", "RED", "YELLOW"]:
+            stats = track_record.get(flag, {})
+            if stats.get("total", 0) >= 3:
+                parts.append(f"{flag}: {stats['accuracy']}% accurate ({stats['total']} calls, avg move {stats.get('avg_move', 0)}%)")
         if parts:
-            track_text = "\nYOUR TRACK RECORD: " + " | ".join(parts)
+            track_text = "\nYOUR TRACK RECORD (last 24h scoring):\n" + "\n".join(parts)
+
+        # Add sector bias
+        sectors = track_record.get("sectors", {})
+        if sectors:
+            best = max(sectors, key=sectors.get)
+            worst = min(sectors, key=sectors.get)
+            if sectors[best] != sectors[worst]:
+                track_text += f"\nSECTOR ACCURACY: Best in {best} ({sectors[best]}%), weakest in {worst} ({sectors[worst]}%)"
+                # Determine which sector this stock is in
+                sym_sectors = {
+                    "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
+                    "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP","SPGI"],
+                    "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","PFE","BMY","GILD","AMGN","MDT","BSX","SYK","ZTS"],
+                    "ENERGY": ["XOM","CVX","COP","PSX","VLO","MPC","HES","DVN","FANG","OXY","SLB","HAL"],
+                    "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","TGT","NKE","SBUX","DIS","NFLX"]
+                }
+                for sec, syms in sym_sectors.items():
+                    if symbol in syms and sec in sectors:
+                        acc = sectors[sec]
+                        if acc < 45:
+                            track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is only {acc}% — be more cautious with this call."
+                        elif acc > 65:
+                            track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is {acc}% — high confidence sector."
+                        break
 
     prompt = f"""You are a portfolio manager making a final investment decision for {name} ({symbol}).
 
