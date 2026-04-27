@@ -829,8 +829,10 @@ def run_agent(symbols=None, force=False):
         track_record["regime"] = market_regime
         print(f"  Market regime:{market_regime[:60]}")
     if track_record:
-        for flag, stats in track_record.items():
-            print(f"  Track record — {flag}: {stats['accuracy']}% accurate ({stats['total']} calls)")
+        for flag in ["GREEN", "RED", "YELLOW"]:
+            stats = track_record.get(flag, {})
+            if isinstance(stats, dict) and stats.get("total", 0) >= 3:
+                print(f"  Track record — {flag}: {stats['accuracy']}% accurate ({stats['total']} calls)")
 
     analyses = []
     for sym in symbols:
