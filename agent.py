@@ -362,6 +362,27 @@ def get_track_record():
         stats["sectors"] = sector_stats
     return stats
 
+def place_paper_trade(symbol, side, qty):
+    """Place a paper trade via Alpaca."""
+    try:
+        url = "https://paper-api.alpaca.markets/v2/orders"
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET,
+            "Content-Type": "application/json"
+        }
+        data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day"
+        }
+        r = requests.post(url, json=data, headers=headers, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
 def get_stock_history(symbol):
     """Get this stock's specific call history to feed into the agent."""
     try:
