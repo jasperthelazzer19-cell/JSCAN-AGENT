@@ -362,6 +362,33 @@ def get_track_record():
         stats["sectors"] = sector_stats
     return stats
 
+def get_stock_history(symbol):
+    """Get this stock's specific call history to feed into the agent."""
+    try:
+        conn = sqlite3.connect("agent.db")
+        c = conn.cursor()
+        c.execute("""
+            SELECT ca.date, ca.flag, ca.price, cr.price_change_pct, cr.outcome
+            FROM calls ca
+            LEFT JOIN call_results cr ON ca.id = cr.call_id AND cr.days_later = 1
+            WHERE ca.symbol = ?
+            ORDER BY ca.date DESC
+            LIMIT 10
+        """, (symbol,))
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            return ""
+        lines = []
+        for date, flag, price, change_pct, outcome in rows:
+            if outcome and change_pct is not None:
+                lines.append(f"  {date}: {flag} at ${price} → {change_pct:+.2f}% ({outcome.upper()})")
+            else:
+                lines.append(f"  {date}: {flag} at ${price} → pending")
+        return "\nTHIS STOCK'S HISTORY:\n" + "\n".join(lines)
+    except:
+        return ""
+
 def get_market_regime():
     """Detect current market regime using SPY and VIX data."""
     try:
