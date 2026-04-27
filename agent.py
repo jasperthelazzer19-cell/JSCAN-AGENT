@@ -309,7 +309,60 @@ def get_track_record():
         stats["sectors"] = sector_stats
     return stats
 
-def news_agent(symbol, name, news):
+def get_market_regime():
+    """Detect current market regime using SPY and VIX data."""
+    try:
+        import requests as req
+        # Get SPY 5-day trend from Polygon
+        spy = req.get(
+            f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2020-01-01/{datetime.now().strftime('%Y-%m-%d')}",
+            params={"apiKey": POLYGON_KEY, "limit": 10, "sort": "desc"},
+            timeout=6
+        ).json().get("results", [])
+
+        if len(spy) < 5:
+            return ""
+
+        recent = spy[0]["c"]
+        week_ago = spy[4]["c"]
+        spy_5d_change = round(((recent - week_ago) / week_ago) * 100, 2)
+
+        # Determine regime
+        if spy_5d_change > 2:
+            regime = "BULL"
+            note = "Market trending strongly up. GREEN calls more likely to succeed."
+        elif spy_5d_change < -2:
+            regime = "BEAR"
+            note = "Market trending down. Be more cautious with GREEN calls, RED more likely to succeed."
+        else:
+            regime = "NEUTRAL"
+            note = "Market range-bound. Stick to high-conviction signals only."
+
+        return f"\nMARKET REGIME: {regime} (SPY 5d: {spy_5d_change:+.2f}%) — {note}"
+    except:
+        return ""
+    """Get this stock's specific call history to feed into the agent."""
+    conn = sqlite3.connect("agent.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT ca.date, ca.flag, ca.price, cr.price_change_pct, cr.outcome
+        FROM calls ca
+        LEFT JOIN call_results cr ON ca.id = cr.call_id AND cr.days_later = 1
+        WHERE ca.symbol = ?
+        ORDER BY ca.date DESC
+        LIMIT 10
+    """, (symbol,))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return ""
+    lines = []
+    for date, flag, price, change_pct, outcome in rows:
+        if outcome and change_pct is not None:
+            lines.append(f"  {date}: {flag} at ${price} → {change_pct:+.2f}% ({outcome.upper()})")
+        else:
+            lines.append(f"  {date}: {flag} at ${price} → pending")
+    return "\nTHIS STOCK'S HISTORY:\n" + "\n".join(lines)
     """Agent 1: Analyzes news sentiment and identifies key catalysts."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     news_text = "\n".join([f"- {n['title']} ({n['source']}, {n['published']})" for n in news]) or "No recent news."
@@ -452,6 +505,9 @@ def portfolio_manager(symbol, price_data, news_report, technical_report, sentime
                             track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is {acc}% — high confidence sector."
                         break
 
+    stock_history = get_stock_history(symbol)
+    market_regime = track_record.get("regime", "")
+
     prompt = f"""You are a portfolio manager making a final investment decision for {name} ({symbol}).
 
 ANALYST REPORTS:
@@ -465,6 +521,8 @@ PRICE: ${price_data.get('price')} | Change: {price_data.get('change_pct')}%
 {prev_call_text}
 {position_text}
 {track_text}
+{stock_history}
+{market_regime}
 
 Based on ALL three analyst reports, make your final decision.
 Be decisive — only use YELLOW if reports genuinely conflict. GREEN or RED when 2+ agents agree.
@@ -722,6 +780,10 @@ def run_agent(symbols=None, force=False):
     print("  Scoring past calls...")
     score_past_calls()
     track_record = get_track_record()
+    market_regime = get_market_regime()
+    if market_regime:
+        track_record["regime"] = market_regime
+        print(f"  Market regime:{market_regime[:60]}")
     if track_record:
         for flag, stats in track_record.items():
             print(f"  Track record — {flag}: {stats['accuracy']}% accurate ({stats['total']} calls)")
