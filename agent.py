@@ -26,6 +26,8 @@ X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
 DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
+DB_PATH = "/app/data/agent.db"
+
 WATCHLIST = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","JPM","V",
     "WMT","XOM","UNH","LLY","MA","JNJ","PG","HD","MRK","COST",
@@ -78,7 +80,7 @@ def add_cors(response):
 
 # ─── DATABASE ─────────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS subscribers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,7 +207,7 @@ def get_alpaca_account():
 WEEKLY_BUDGET = 10000  # $10k paper money per week
 
 def get_weekly_budget_remaining():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     week = datetime.utcnow().strftime("%Y-W%W")
     c.execute("SELECT deployed FROM weekly_budget WHERE week = ?", (week,))
@@ -216,7 +218,7 @@ def get_weekly_budget_remaining():
     return max(0, WEEKLY_BUDGET - row[0])
 
 def record_budget_deployment(amount, portfolio_value):
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     week = datetime.utcnow().strftime("%Y-W%W")
     c.execute("""INSERT INTO weekly_budget (week, deployed, starting_value, current_value)
@@ -229,7 +231,7 @@ def record_budget_deployment(amount, portfolio_value):
     conn.close()
 
 def get_portfolio_history():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT week, deployed, starting_value, current_value FROM weekly_budget ORDER BY week DESC LIMIT 12")
     rows = c.fetchall()
@@ -257,7 +259,7 @@ def place_paper_trade(symbol, side, qty):
         return {"error": str(e)}
 
 def get_previous_calls():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     week_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
     c.execute("SELECT symbol, date, flag, price, thesis FROM calls WHERE date >= ? ORDER BY date DESC", (week_ago,))
@@ -266,7 +268,7 @@ def get_previous_calls():
     return [{"symbol": r[0], "date": r[1], "flag": r[2], "price": r[3], "thesis": r[4]} for r in rows]
 
 def save_call(symbol, flag, price, thesis):
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today = datetime.utcnow().strftime("%Y-%m-%d")
     c.execute("INSERT INTO calls (symbol, date, flag, price, thesis) VALUES (?, ?, ?, ?, ?)",
@@ -276,7 +278,7 @@ def save_call(symbol, flag, price, thesis):
 
 # ─── SELF-LEARNING ────────────────────────────────────────
 def score_past_calls():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     scored = 0
 
@@ -323,7 +325,7 @@ def score_past_calls():
     return scored
 
 def get_track_record():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     stats = {}
@@ -371,7 +373,7 @@ def get_track_record():
 
 def get_stock_history(symbol):
     try:
-        conn = sqlite3.connect("agent.db")
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
             SELECT ca.date, ca.flag, ca.price, cr.price_change_pct, cr.outcome
@@ -816,7 +818,7 @@ def run_agent(symbols=None, force=False):
     portfolio_val = float(account.get("portfolio_value", 0))
 
     budget_remaining = get_weekly_budget_remaining()
-    per_position = round(budget_remaining / 10, 2)
+    per_position = round(min(budget_remaining / 20, 500), 2)
     total_deployed = 0
 
     print("  Scoring past calls...")
@@ -879,7 +881,7 @@ def run_agent(symbols=None, force=False):
     if total_deployed > 0:
         print(f"  Total deployed this session: ${total_deployed:,.0f}")
 
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
         c.execute("ALTER TABLE subscribers ADD COLUMN paid INTEGER DEFAULT 0")
@@ -973,7 +975,7 @@ def generate_marketing_post(analyses, with_link=False):
     red_count = len(reds)
 
     try:
-        conn = sqlite3.connect("agent.db")
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT ca.flag, cr.outcome FROM calls ca JOIN call_results cr ON ca.id = cr.call_id WHERE cr.days_later = 1 ORDER BY ca.created_at DESC LIMIT 50")
         rows = c.fetchall()
@@ -1184,7 +1186,7 @@ def subscribe():
     if not email or not stocks:
         return jsonify({"success": False, "error": "Missing email or stocks"})
     try:
-        conn = sqlite3.connect("agent.db")
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO subscribers (email, stocks) VALUES (?, ?)",
                   (email, json.dumps(stocks)))
@@ -1202,7 +1204,7 @@ def trigger_run():
 
 @app.route("/status")
 def status():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM subscribers WHERE active=1")
     subs = c.fetchone()[0]
@@ -1221,7 +1223,7 @@ def status():
 
 @app.route("/dashboard")
 def dashboard():
-    conn = sqlite3.connect("agent.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM subscribers WHERE active=1")
     subs = c.fetchone()[0]
@@ -1411,7 +1413,7 @@ if __name__ == "__main__":
     print("JSCAN Agent starting...")
     print(f"Watching {len(WATCHLIST)} stocks")
 
-    schedule.every().day.at("15:00").do(run_agent)  # 8am PDT = 15:00 UTC
+    schedule.every().day.at("14:00").do(run_agent)  # 7am PDT = 14:00 UTC, email arrives ~8am
 
     import threading
     def run_schedule():
