@@ -4,3 +4,4 @@ anthropic
 sendgrid
 schedule
 tweepy
+yfinance

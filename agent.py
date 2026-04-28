@@ -2,13 +2,16 @@ import os
 import time
 import json
 import sqlite3
+import threading
 import requests
 import schedule
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
 import anthropic
 import sendgrid
 from sendgrid.helpers.mail import Mail
+import yfinance as yf
 
 # ─── CONFIG ───────────────────────────────────────────────
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
@@ -27,6 +30,10 @@ DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
 DB_PATH = "/app/data/agent.db"
+MAX_WORKERS = 10
+
+# Module-level singleton — thread-safe, reused across all agent calls
+ANTHROPIC = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 WATCHLIST = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","JPM","V",
@@ -69,6 +76,14 @@ STOCK_NAMES = {
     "AXP":"American Express","COF":"Capital One"
 }
 
+SECTOR_MAP = {
+    "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
+    "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP"],
+    "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","AMGN"],
+    "ENERGY": ["XOM","CVX"],
+    "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","DIS","NFLX"]
+}
+
 app = Flask(__name__)
 
 @app.after_request
@@ -82,13 +97,21 @@ def add_cors(response):
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute("""CREATE TABLE IF NOT EXISTS subscribers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         email TEXT UNIQUE NOT NULL,
         stocks TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        active INTEGER DEFAULT 1
+        active INTEGER DEFAULT 1,
+        paid INTEGER DEFAULT 0
     )""")
+    # Defensive migration for already-existing subscribers tables
+    try:
+        c.execute("ALTER TABLE subscribers ADD COLUMN paid INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     c.execute("""CREATE TABLE IF NOT EXISTS calls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
@@ -120,10 +143,9 @@ def init_db():
 def get_stock_data(symbols):
     result = {}
     try:
-        # Walk back from yesterday to find the most recent trading day
         check_date = datetime.utcnow() - timedelta(days=1)
         for _ in range(7):
-            if check_date.weekday() < 5:  # 0=Mon, 4=Fri
+            if check_date.weekday() < 5:
                 break
             check_date -= timedelta(days=1)
         date_str = check_date.strftime("%Y-%m-%d")
@@ -163,6 +185,41 @@ def get_stock_data(symbols):
     except Exception as e:
         print(f"Stock data error: {e}")
     return result
+
+def get_historical_bars(symbol, days=70):
+    try:
+        # Yahoo uses BRK-B format directly; no conversion needed
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="3mo", auto_adjust=True)
+        if hist.empty:
+            return []
+        # Filter NaN (c == c is False for NaN)
+        return [float(c) for c in hist["Close"].tolist() if c == c]
+    except Exception:
+        return []
+
+def compute_indicators(closes):
+    out = {"rsi": None, "ma20": None, "ma50": None, "trend_5d": None}
+    if not closes:
+        return out
+
+    if len(closes) >= 15:
+        deltas = [closes[i] - closes[i - 1] for i in range(len(closes) - 14, len(closes))]
+        gains = sum(d for d in deltas if d > 0) / 14
+        losses = sum(-d for d in deltas if d < 0) / 14
+        if losses == 0:
+            out["rsi"] = 100.0
+        else:
+            rs = gains / losses
+            out["rsi"] = round(100 - (100 / (1 + rs)), 1)
+
+    if len(closes) >= 20:
+        out["ma20"] = round(sum(closes[-20:]) / 20, 2)
+    if len(closes) >= 50:
+        out["ma50"] = round(sum(closes[-50:]) / 50, 2)
+    if len(closes) >= 6:
+        out["trend_5d"] = round(((closes[-1] - closes[-6]) / closes[-6]) * 100, 2)
+    return out
 
 def get_news(symbol, name):
     try:
@@ -340,19 +397,12 @@ def get_track_record():
         total = sum(r[1] for r in rows)
         if total > 0:
             correct = sum(r[1] for r in rows if r[0] == "correct")
-            avg_move = round(sum(r[2]*r[1] for r in rows if r[2]) / total, 2) if rows else 0
+            avg_move = round(sum(r[2] * r[1] for r in rows if r[2]) / total, 2) if rows else 0
             accuracy = round((correct / total) * 100, 1)
             stats[flag] = {"accuracy": accuracy, "total": total, "correct": correct, "avg_move": avg_move}
 
     sector_stats = {}
-    sectors = {
-        "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
-        "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP"],
-        "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","AMGN"],
-        "ENERGY": ["XOM","CVX"],
-        "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","DIS","NFLX"]
-    }
-    for sector, syms in sectors.items():
+    for sector, syms in SECTOR_MAP.items():
         placeholders = ",".join("?" * len(syms))
         c.execute(f"""
             SELECT outcome, COUNT(*) FROM call_results cr
@@ -390,9 +440,9 @@ def get_stock_history(symbol):
         lines = []
         for date, flag, price, change_pct, outcome in rows:
             if outcome and change_pct is not None:
-                lines.append(f"  {date}: {flag} at ${price} → {change_pct:+.2f}% ({outcome.upper()})")
+                lines.append(f"  {date}: {flag} at ${price} -> {change_pct:+.2f}% ({outcome.upper()})")
             else:
-                lines.append(f"  {date}: {flag} at ${price} → pending")
+                lines.append(f"  {date}: {flag} at ${price} -> pending")
         return "\nTHIS STOCK'S HISTORY:\n" + "\n".join(lines)
     except:
         return ""
@@ -422,13 +472,86 @@ def get_market_regime():
             regime = "NEUTRAL"
             note = "Market range-bound. Stick to high-conviction signals only."
 
-        return f"\nMARKET REGIME: {regime} (SPY 5d: {spy_5d_change:+.2f}%) — {note}"
+        return f"\nMARKET REGIME: {regime} (SPY 5d: {spy_5d_change:+.2f}%) - {note}"
     except:
         return ""
 
 # ─── CLAUDE ANALYSIS ──────────────────────────────────────
+PORTFOLIO_MANAGER_SYSTEM = """You are an elite portfolio manager and investment analyst making final BUY/SELL/HOLD decisions on US equities. Your role is to synthesize three independent specialist analyst reports into a single, actionable trading signal for each stock.
+
+# Your Inputs
+For every decision you receive:
+1. NEWS AGENT REPORT: a sentiment score (-10 to +10), the key catalyst, any risk flags, and a 1-sentence summary.
+2. TECHNICAL AGENT REPORT: momentum classification, volume signal, range position, RSI(14), 20-day and 50-day moving averages, MA-cross signal, and a strength score (-10 to +10).
+3. SENTIMENT AGENT REPORT: market conditions (RISK_ON/NEUTRAL/RISK_OFF), the stock's relative strength vs. market, a macro score (-10 to +10).
+4. CURRENT PRICE DATA: latest price, intraday change %.
+5. PRIOR CALL HISTORY: your last call on this stock within 7 days (if any) and how that call has performed since.
+6. CURRENT POSITION: existing paper position (qty, avg cost, unrealized P&L) if you already hold the stock.
+7. TRACK RECORD: your historical accuracy by flag type (GREEN/RED/YELLOW) and by sector, plus average move size.
+8. STOCK HISTORY: this specific stock's last 10 calls and their scored outcomes.
+9. MARKET REGIME: SPY 5-day trend classified as BULL / NEUTRAL / BEAR.
+
+# Decision Framework
+
+## Flag Selection (GREEN / YELLOW / RED)
+
+GREEN — Bullish conviction. Use when:
+- At least 2 of 3 analyst reports lean positive (sentiment > +3, technical strength > +3, or relative outperformance with macro score >= 0).
+- No major risk flags from news agent.
+- Stock is not technically overbought (RSI < 75).
+- Market regime supports the call. In a strong BEAR regime require all three reports to lean positive.
+
+RED — Bearish conviction. Use when:
+- At least 2 of 3 analyst reports lean negative.
+- Risk flags present, or downward momentum confirmed by technicals.
+- Stock is technically extended on the upside (RSI > 75) and showing distribution, OR breaking below key MAs.
+
+YELLOW — Genuine uncertainty. Use ONLY when:
+- Reports conflict materially (e.g., bullish news + bearish technicals with no clear resolution).
+- Critical data is missing (one or more agents reported "unavailable").
+- Stock is in a tight range (price between MA20 and MA50, RSI 45-55, no catalyst).
+DO NOT default to YELLOW out of caution. If 2+ reports agree, commit to GREEN or RED.
+
+## Action Selection (BUY / HOLD / SELL / WATCH)
+- BUY: GREEN flag with HIGH or MEDIUM confidence and no current position. (For low-confidence GREEN with no position, prefer WATCH.)
+- HOLD: GREEN flag with existing profitable position; OR YELLOW with existing position that is not deteriorating; OR existing position where thesis is intact even if today's signal is mixed.
+- SELL: RED flag with existing position; OR existing position where unrealized P&L is < -5% AND the underlying thesis has deteriorated.
+- WATCH: YELLOW flag with no position; OR low-conviction GREEN/RED where you want to see confirmation.
+
+## Confidence Calibration
+- HIGH: 3 of 3 reports align in direction, market regime supports the call, technicals confirm (RSI in healthy range, price relationship to MAs supports direction).
+- MEDIUM: 2 of 3 reports align with the third neutral; OR strong directional signal but mixed market regime.
+- LOW: Reports mixed or marginal data quality (an agent reported "unavailable"); never use HIGH confidence when one of the inputs is missing.
+
+# Self-Awareness Rules
+- If your historical GREEN accuracy is below 50%, raise the bar: only GREEN with 3-of-3 agreement.
+- If you are in a sector where your accuracy is below 45%, downgrade confidence by one level.
+- If you called this stock GREEN within the past 7 days and it has dropped, do NOT mechanically re-issue GREEN. Reassess the thesis honestly. If the original thesis is broken, switch to YELLOW or RED.
+- If market regime is BEAR, raise the bar for new GREEN calls.
+- If market regime is BULL, raise the bar for new RED calls.
+- If you already hold a profitable position, prefer HOLD over re-issuing BUY (no stacking).
+
+# Output Format
+
+Respond in this EXACT format with no preamble, no markdown, no extra commentary:
+
+FLAG: [GREEN / YELLOW / RED]
+BULL CASE: [1-2 sentences. The strongest specific case for upside, citing concrete data points.]
+BEAR CASE: [1-2 sentences. The strongest specific case for downside, citing concrete data points.]
+VERDICT: [1-2 sentences. Your final synthesis. Be specific about timeframe (next 1-7 days vs 30+ days). Reference the dominant signal.]
+ACTION: [BUY / HOLD / SELL / WATCH]
+CONFIDENCE: [HIGH / MEDIUM / LOW]
+
+# Style Guidelines
+- Be direct. Avoid hedging language ("could potentially", "might possibly", "it is unclear whether").
+- Reference specific numbers: prices, percentages, RSI levels, MA crossovers, news catalysts.
+- Distinguish short-term (1-7 days) from longer-term (30+ days). Your scoring window is 1, 7, and 30 days, so calibrate to those horizons.
+- Never recommend BUY without an identifiable catalyst or technical setup.
+- Never recommend SELL purely on a single down day. SELL requires a deteriorating thesis, not just a dip.
+- Never invent data the analysts did not provide. If a value is N/A, treat it as missing, not as zero."""
+
+
 def news_agent(symbol, name, news):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     news_text = "\n".join([f"- {n['title']} ({n['source']}, {n['published']})" for n in news]) or "No recent news."
     prompt = f"""You are a financial news analyst. Analyze recent news for {name} ({symbol}).
 
@@ -441,15 +564,15 @@ KEY_CATALYST: [single most important news item, or "None" if no significant news
 RISK_FLAG: [any major risks mentioned in news, or "None"]
 SUMMARY: [1 sentence summary of news sentiment]"""
 
-    msg = client.messages.create(
+    msg = ANTHROPIC.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
     return msg.content[0].text
 
-def technical_agent(symbol, name, price_data):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+def technical_agent(symbol, name, price_data, indicators=None):
+    indicators = indicators or {}
     price = price_data.get("price", 0)
     open_p = price_data.get("open", 0)
     high = price_data.get("high", 0)
@@ -461,32 +584,65 @@ def technical_agent(symbol, name, price_data):
     range_position = ((price - low) / day_range * 100) if day_range > 0 else 50
     body_size = abs(price - open_p) / open_p * 100 if open_p else 0
 
+    rsi = indicators.get("rsi")
+    ma20 = indicators.get("ma20")
+    ma50 = indicators.get("ma50")
+    trend_5d = indicators.get("trend_5d")
+
+    rsi_str = f"{rsi}" if rsi is not None else "N/A"
+    rsi_note = ""
+    if rsi is not None:
+        if rsi >= 70: rsi_note = " (overbought)"
+        elif rsi <= 30: rsi_note = " (oversold)"
+    ma20_str = f"${ma20}" if ma20 is not None else "N/A"
+    ma50_str = f"${ma50}" if ma50 is not None else "N/A"
+    trend_str = f"{trend_5d:+.2f}%" if trend_5d is not None else "N/A"
+
+    if ma20 is not None and ma50 is not None and price:
+        if price > ma20 > ma50:
+            ma_signal = "Price above both MAs; MA20 > MA50 (bullish stack)"
+        elif price < ma20 < ma50:
+            ma_signal = "Price below both MAs; MA20 < MA50 (bearish stack)"
+        elif ma20 > ma50:
+            ma_signal = "MA20 > MA50 but price between/below; trend intact but momentum weakening"
+        else:
+            ma_signal = "MA20 < MA50 (bearish cross); rallies likely to be sold"
+    else:
+        ma_signal = "N/A (insufficient history)"
+
     prompt = f"""You are a technical analyst. Analyze the price action for {name} ({symbol}).
 
-PRICE DATA:
+INTRADAY:
 - Current: ${price} | Change: {change_pct}%
 - Open: ${open_p} | High: ${high} | Low: ${low}
 - Day Range: ${day_range:.2f} | Position in range: {range_position:.0f}%
 - Volume: {volume:,}
 - Candle body size: {body_size:.2f}%
 
+TREND INDICATORS:
+- 5-day price trend: {trend_str}
+- 20-day moving average: {ma20_str}
+- 50-day moving average: {ma50_str}
+- MA signal: {ma_signal}
+- RSI(14): {rsi_str}{rsi_note}
+
 Respond in this EXACT format:
 MOMENTUM: [STRONG_UP / UP / NEUTRAL / DOWN / STRONG_DOWN]
 VOLUME_SIGNAL: [HIGH / NORMAL / LOW]
 RANGE_POSITION: [TOP_THIRD / MIDDLE / BOTTOM_THIRD]
+TREND: [BULLISH / NEUTRAL / BEARISH]
+RSI_SIGNAL: [OVERBOUGHT / NEUTRAL / OVERSOLD]
 STRENGTH_SCORE: [number from -10 to +10]
-SUMMARY: [1 sentence technical assessment]"""
+SUMMARY: [1 sentence technical assessment that incorporates the MA and RSI context]"""
 
-    msg = client.messages.create(
+    msg = ANTHROPIC.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=200,
+        max_tokens=250,
         messages=[{"role": "user", "content": prompt}]
     )
     return msg.content[0].text
 
 def sentiment_agent(symbol, name, price_data, all_prices):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
     changes = [v.get("change_pct", 0) for v in all_prices.values() if v.get("change_pct") is not None]
     market_avg = round(sum(changes) / len(changes), 2) if changes else 0
     stock_change = price_data.get("change_pct", 0)
@@ -505,7 +661,7 @@ RELATIVE_STRENGTH: [OUTPERFORMING / IN_LINE / UNDERPERFORMING]
 MACRO_SCORE: [number from -10 to +10]
 SUMMARY: [1 sentence macro/sentiment assessment]"""
 
-    msg = client.messages.create(
+    msg = ANTHROPIC.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=150,
         messages=[{"role": "user", "content": prompt}]
@@ -513,7 +669,6 @@ SUMMARY: [1 sentence macro/sentiment assessment]"""
     return msg.content[0].text
 
 def portfolio_manager(symbol, price_data, news_report, technical_report, sentiment_report, previous_calls, positions, track_record):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     name = STOCK_NAMES.get(symbol, symbol)
 
     prev_call_text = ""
@@ -538,89 +693,83 @@ def portfolio_manager(symbol, price_data, news_report, technical_report, sentime
             if isinstance(stats, dict) and stats.get("total", 0) >= 3:
                 parts.append(f"{flag}: {stats['accuracy']}% accurate ({stats['total']} calls, avg move {stats.get('avg_move', 0)}%)")
         if parts:
-            track_text = "\nYOUR TRACK RECORD (last 24h scoring):\n" + "\n".join(parts)
+            track_text = "\nYOUR TRACK RECORD (1d scoring window):\n" + "\n".join(parts)
 
         sectors = track_record.get("sectors", {})
         if sectors:
             best = max(sectors, key=sectors.get)
             worst = min(sectors, key=sectors.get)
             if sectors[best] != sectors[worst]:
-                track_text += f"\nSECTOR ACCURACY: Best in {best} ({sectors[best]}%), weakest in {worst} ({sectors[worst]}%)"
-                sym_sectors = {
-                    "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
-                    "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP"],
-                    "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","AMGN"],
-                    "ENERGY": ["XOM","CVX"],
-                    "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","DIS","NFLX"]
-                }
-                for sec, syms in sym_sectors.items():
+                track_text += f"\nSECTOR ACCURACY: Best {best} ({sectors[best]}%), weakest {worst} ({sectors[worst]}%)"
+                for sec, syms in SECTOR_MAP.items():
                     if symbol in syms and sec in sectors:
                         acc = sectors[sec]
                         if acc < 45:
-                            track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is only {acc}% — be more cautious."
+                            track_text += f"\nNOTE: {symbol} is in {sec} where accuracy is {acc}% — be more cautious."
                         elif acc > 65:
-                            track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is {acc}% — high confidence sector."
+                            track_text += f"\nNOTE: {symbol} is in {sec} where accuracy is {acc}% — high-confidence sector."
                         break
 
     stock_history = get_stock_history(symbol)
     market_regime = track_record.get("regime", "")
 
-    prompt = f"""You are a portfolio manager making a final investment decision for {name} ({symbol}).
+    user_msg = f"""Stock: {name} ({symbol})
 
 ANALYST REPORTS:
-NEWS AGENT: {news_report}
+NEWS AGENT:
+{news_report}
 
-TECHNICAL AGENT: {technical_report}
+TECHNICAL AGENT:
+{technical_report}
 
-SENTIMENT AGENT: {sentiment_report}
+SENTIMENT AGENT:
+{sentiment_report}
 
-PRICE: ${price_data.get('price')} | Change: {price_data.get('change_pct')}%
+CURRENT DATA:
+Price: ${price_data.get('price')} | Change: {price_data.get('change_pct')}%
 {prev_call_text}
 {position_text}
 {track_text}
 {stock_history}
 {market_regime}
 
-Based on ALL three analyst reports, make your final decision.
-Be decisive — only use YELLOW if reports genuinely conflict. GREEN or RED when 2+ agents agree.
+Make your decision now."""
 
-Respond in this EXACT format:
-FLAG: [GREEN / YELLOW / RED]
-BULL CASE: [1-2 sentences]
-BEAR CASE: [1-2 sentences]
-VERDICT: [1-2 sentences — your final call with conviction]
-ACTION: [BUY / HOLD / SELL / WATCH]
-CONFIDENCE: [HIGH / MEDIUM / LOW]"""
-
-    msg = client.messages.create(
+    msg = ANTHROPIC.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
+        system=[
+            {
+                "type": "text",
+                "text": PORTFOLIO_MANAGER_SYSTEM,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ],
+        messages=[{"role": "user", "content": user_msg}]
     )
     return msg.content[0].text
 
-def analyze_stock(symbol, price_data, news, previous_calls, positions, track_record=None, all_prices=None):
+def analyze_stock(symbol, price_data, news, previous_calls, positions, track_record=None, all_prices=None, indicators=None):
     name = STOCK_NAMES.get(symbol, symbol)
     if all_prices is None:
         all_prices = {symbol: price_data}
 
     try:
         news_report = news_agent(symbol, name, news)
-    except Exception as e:
-        news_report = f"SENTIMENT_SCORE: 0\nKEY_CATALYST: None\nRISK_FLAG: None\nSUMMARY: News analysis unavailable."
+    except Exception:
+        news_report = "SENTIMENT_SCORE: 0\nKEY_CATALYST: None\nRISK_FLAG: None\nSUMMARY: News analysis unavailable."
 
     try:
-        tech_report = technical_agent(symbol, name, price_data)
-    except Exception as e:
-        tech_report = f"MOMENTUM: NEUTRAL\nVOLUME_SIGNAL: NORMAL\nRANGE_POSITION: MIDDLE\nSTRENGTH_SCORE: 0\nSUMMARY: Technical analysis unavailable."
+        tech_report = technical_agent(symbol, name, price_data, indicators)
+    except Exception:
+        tech_report = "MOMENTUM: NEUTRAL\nVOLUME_SIGNAL: NORMAL\nRANGE_POSITION: MIDDLE\nTREND: NEUTRAL\nRSI_SIGNAL: NEUTRAL\nSTRENGTH_SCORE: 0\nSUMMARY: Technical analysis unavailable."
 
     try:
         sent_report = sentiment_agent(symbol, name, price_data, all_prices)
-    except Exception as e:
-        sent_report = f"MARKET_CONDITIONS: NEUTRAL\nRELATIVE_STRENGTH: IN_LINE\nMACRO_SCORE: 0\nSUMMARY: Sentiment analysis unavailable."
+    except Exception:
+        sent_report = "MARKET_CONDITIONS: NEUTRAL\nRELATIVE_STRENGTH: IN_LINE\nMACRO_SCORE: 0\nSUMMARY: Sentiment analysis unavailable."
 
-    final = portfolio_manager(symbol, price_data, news_report, tech_report, sent_report, previous_calls, positions, track_record or {})
-    return final
+    return portfolio_manager(symbol, price_data, news_report, tech_report, sent_report, previous_calls, positions, track_record or {})
 
 def parse_analysis(text):
     lines = text.strip().split("\n")
@@ -802,6 +951,57 @@ def build_free_email(analyses, account):
 </html>"""
     return html
 
+# ─── PER-STOCK WORKER ─────────────────────────────────────
+def analyze_one_stock(sym, price_data_all, previous_calls, positions, track_record, budget_lock, budget_state):
+    if sym not in price_data_all:
+        return None
+    pd = price_data_all[sym]
+    name = STOCK_NAMES.get(sym, sym)
+
+    news = get_news(sym, name)
+    closes = get_historical_bars(sym)
+    indicators = compute_indicators(closes)
+
+    try:
+        raw = analyze_stock(sym, pd, news, previous_calls, positions, track_record, price_data_all, indicators)
+    except Exception as e:
+        print(f"  Error analyzing {sym}: {e}")
+        return None
+
+    parsed = parse_analysis(raw)
+    parsed["symbol"] = sym
+    parsed["name"] = name
+    parsed["price"] = pd["price"]
+    parsed["change_pct"] = pd["change_pct"]
+
+    try:
+        save_call(sym, parsed["flag"], pd["price"], parsed["verdict"])
+    except Exception as e:
+        print(f"  save_call error for {sym}: {e}")
+
+    action = parsed["action"].upper()
+    if "BUY" in action and parsed["flag"] == "GREEN":
+        price = pd["price"]
+        if price and price > 0:
+            with budget_lock:
+                remaining = get_weekly_budget_remaining()
+                if remaining > 0:
+                    budget_per = min(budget_state["per_position"], remaining)
+                    qty = max(1, int(budget_per / price))
+                    cost = round(qty * price, 2)
+                    if cost <= remaining:
+                        result = place_paper_trade(sym, "buy", qty)
+                        if "error" not in result:
+                            record_budget_deployment(cost, budget_state["portfolio_val"])
+                            budget_state["total_deployed"] += cost
+                        print(f"    Paper BUY {qty}x {sym} @ ${price} = ${cost}: {result.get('status', result.get('error', 'unknown'))}")
+    elif "SELL" in action and sym in positions:
+        qty = positions[sym].get("qty", 1)
+        result = place_paper_trade(sym, "sell", qty)
+        print(f"    Paper SELL {qty}x {sym}: {result.get('status', result.get('error', 'unknown'))}")
+
+    return parsed
+
 # ─── MAIN AGENT RUN ───────────────────────────────────────
 def run_agent(symbols=None, force=False):
     if not force and datetime.utcnow().weekday() >= 5:
@@ -809,7 +1009,7 @@ def run_agent(symbols=None, force=False):
         return []
     if symbols is None:
         symbols = WATCHLIST
-    print(f"[{datetime.utcnow()}] Agent running for {len(symbols)} stocks...")
+    print(f"[{datetime.utcnow()}] Agent running for {len(symbols)} stocks (parallel x{MAX_WORKERS})...")
 
     price_data = get_stock_data(symbols)
     positions = get_alpaca_positions()
@@ -819,7 +1019,6 @@ def run_agent(symbols=None, force=False):
 
     budget_remaining = get_weekly_budget_remaining()
     per_position = round(min(budget_remaining / 20, 500), 2)
-    total_deployed = 0
 
     print("  Scoring past calls...")
     score_past_calls()
@@ -834,60 +1033,41 @@ def run_agent(symbols=None, force=False):
             if isinstance(stats, dict) and stats.get("total", 0) >= 3:
                 print(f"  Track record — {flag}: {stats['accuracy']}% accurate ({stats['total']} calls)")
 
+    budget_lock = threading.Lock()
+    budget_state = {"per_position": per_position, "portfolio_val": portfolio_val, "total_deployed": 0}
+
     analyses = []
-    for sym in symbols:
-        if sym not in price_data:
-            print(f"  Skipping {sym} — no price data")
-            continue
-        print(f"  Analyzing {sym}...")
-        pd = price_data[sym]
-        news = get_news(sym, STOCK_NAMES.get(sym, sym))
-        try:
-            raw = analyze_stock(sym, pd, news, previous_calls, positions, track_record, price_data)
-            parsed = parse_analysis(raw)
-            parsed["symbol"] = sym
-            parsed["name"] = STOCK_NAMES.get(sym, sym)
-            parsed["price"] = pd["price"]
-            parsed["change_pct"] = pd["change_pct"]
-            analyses.append(parsed)
-            save_call(sym, parsed["flag"], pd["price"], parsed["verdict"])
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(analyze_one_stock, sym, price_data, previous_calls, positions, track_record, budget_lock, budget_state): sym
+            for sym in symbols
+        }
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    analyses.append(result)
+                    print(f"  Done {sym}: {result['flag']}")
+            except Exception as e:
+                print(f"  Worker exception for {sym}: {e}")
 
-            action = parsed["action"].upper()
-            if "BUY" in action and parsed["flag"] == "GREEN":
-                price = pd["price"]
-                if price and price > 0:
-                    budget_per = min(per_position, get_weekly_budget_remaining())
-                    qty = max(1, int(budget_per / price))
-                    cost = round(qty * price, 2)
-                    result = place_paper_trade(sym, "buy", qty)
-                    if "error" not in result:
-                        record_budget_deployment(cost, portfolio_val)
-                        total_deployed += cost
-                    print(f"    Paper BUY {qty}x {sym} @ ${price} = ${cost}: {result.get('status', result.get('error', 'unknown'))}")
-            elif "SELL" in action and sym in positions:
-                qty = positions[sym].get("qty", 1)
-                result = place_paper_trade(sym, "sell", qty)
-                print(f"    Paper SELL {qty}x {sym}: {result.get('status', result.get('error', 'unknown'))}")
-
-        except Exception as e:
-            print(f"  Error analyzing {sym}: {e}")
-        time.sleep(0.5)
+    elapsed = time.time() - start_time
+    print(f"  Analysis complete in {elapsed:.1f}s ({len(analyses)}/{len(symbols)} stocks)")
 
     green_signals = [a for a in analyses if a["flag"] == "GREEN"]
     if green_signals:
         per_position = round(budget_remaining / max(len(green_signals), 1), 2)
     print(f"  Weekly budget remaining: ${budget_remaining:,.0f} | Per position: ${per_position:,.0f} | GREEN signals: {len(green_signals)}")
+    if budget_state["total_deployed"] > 0:
+        print(f"  Total deployed this session: ${budget_state['total_deployed']:,.0f}")
 
-    if total_deployed > 0:
-        print(f"  Total deployed this session: ${total_deployed:,.0f}")
+    order = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    analyses.sort(key=lambda x: order.get(x["flag"], 1))
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    try:
-        c.execute("ALTER TABLE subscribers ADD COLUMN paid INTEGER DEFAULT 0")
-        conn.commit()
-    except:
-        pass
     c.execute("SELECT email, stocks, paid FROM subscribers WHERE active=1")
     subscribers = c.fetchall()
     conn.close()
@@ -905,8 +1085,7 @@ def run_agent(symbols=None, force=False):
                 greens = [a for a in user_analyses if a["flag"] == "GREEN"][:3]
                 reds = [a for a in user_analyses if a["flag"] == "RED"][:3]
                 yellows = [a for a in user_analyses if a["flag"] == "YELLOW"][:2]
-                free_analyses = greens + reds + yellows
-                user_html = build_free_email(free_analyses, account)
+                user_html = build_free_email(greens + reds + yellows, account)
             else:
                 user_html = build_email(user_analyses, account)
 
@@ -922,7 +1101,9 @@ def run_agent(symbols=None, force=False):
             print(f"  Email error for {email}: {e}")
 
     print(f"[{datetime.utcnow()}] Agent done. Analyzed {len(analyses)} stocks.")
-    run_marketing(analyses)
+
+    # Marketing runs in background so it doesn't block the schedule thread
+    threading.Thread(target=run_marketing, args=(analyses,), daemon=True).start()
     return analyses
 
 # ─── MARKETING AGENT ──────────────────────────────────────
@@ -964,15 +1145,13 @@ def post_to_discord(text):
         print(f"  Discord post failed: {e}")
         return False
 
-def generate_marketing_post(analyses, with_link=False):
+def generate_marketing_post(analyses):
     if not analyses:
         return None
     greens = [a for a in analyses if a["flag"] == "GREEN"]
     reds = [a for a in analyses if a["flag"] == "RED"]
     best = greens[0] if greens else (reds[0] if reds else analyses[0])
     flag = best["flag"]
-    green_count = len(greens)
-    red_count = len(reds)
 
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -988,13 +1167,11 @@ def generate_marketing_post(analyses, with_link=False):
     except:
         accuracy_line = "AI-powered stock research agent."
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    if with_link:
-        prompt = f"""Write a compelling tweet about this AI stock signal. Include the signup URL as plain text.
+    prompt = f"""Write a compelling tweet about today's AI stock signal. Include the signup URL as plain text.
 
 Signal: {best['symbol']} flagged {flag} at ${best['price']}
 Thesis: {best.get('verdict','')[:120]}
-Today: {green_count} GREEN, {red_count} RED out of {len(analyses)} stocks analyzed
+Today: {len(greens)} GREEN, {len(reds)} RED out of {len(analyses)} stocks analyzed
 {accuracy_line}
 URL: jscan-agent.up.railway.app
 
@@ -1004,23 +1181,8 @@ Rules:
 - Include jscan-agent.up.railway.app as plain text
 - Max 2 hashtags
 - Be specific about the signal"""
-    else:
-        prompt = f"""Write a short punchy tweet about this AI stock signal. No links.
 
-Signal: {best['symbol']} flagged {flag} at ${best['price']}
-Thesis: {best.get('verdict','')[:120]}
-Today: {green_count} GREEN, {red_count} RED out of {len(analyses)} stocks analyzed
-{accuracy_line}
-
-Rules:
-- Max 240 chars
-- Sound like a real trader not a bot
-- NO links or URLs
-- Max 2 hashtags (#stocks #algotrading)
-- Mention JSCAN naturally
-- Be specific and interesting"""
-
-    msg = client.messages.create(
+    msg = ANTHROPIC.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}]
@@ -1058,17 +1220,9 @@ def run_marketing(analyses):
     if discord_msg:
         post_to_discord(discord_msg)
 
-    link_tweet = generate_marketing_post(analyses, with_link=True)
-    if link_tweet:
-        post_to_x(link_tweet)
-        time.sleep(60)
-
-    for i in range(4):
-        plain_tweet = generate_marketing_post(analyses, with_link=False)
-        if plain_tweet:
-            post_to_x(plain_tweet)
-            if i < 3:
-                time.sleep(900)
+    tweet = generate_marketing_post(analyses)
+    if tweet:
+        post_to_x(tweet)
 
     print(f"[{datetime.utcnow()}] Marketing done.")
 
@@ -1198,7 +1352,6 @@ def subscribe():
 
 @app.route("/run", methods=["POST"])
 def trigger_run():
-    import threading
     threading.Thread(target=lambda: run_agent(force=True), daemon=True).start()
     return jsonify({"success": True, "message": "Agent started in background"})
 
@@ -1413,9 +1566,8 @@ if __name__ == "__main__":
     print("JSCAN Agent starting...")
     print(f"Watching {len(WATCHLIST)} stocks")
 
-    schedule.every().day.at("14:00").do(run_agent)  # 7am PDT = 14:00 UTC, email arrives ~8am
+    schedule.every().day.at("14:00").do(run_agent)
 
-    import threading
     def run_schedule():
         while True:
             schedule.run_pending()
