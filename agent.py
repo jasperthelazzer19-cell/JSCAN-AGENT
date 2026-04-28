@@ -167,9 +167,9 @@ WATCHLIST = [
     "ACN","MCD","CSCO","ABT","LIN","DHR","WFC","TXN","NEE","PM",
     "RTX","AMGN","LOW","ORCL","UPS","INTC","QCOM","CAT","NOW","INTU",
     "PLTR","SNOW","COIN","HOOD","RBLX","UBER","LYFT","ABNB","DASH","SPOT",
-    "SHOP","SQ","PYPL","SOFI","AFRM","NET","DDOG","ZS","CRWD","OKTA",
+    "SHOP","PYPL","SOFI","AFRM","NET","DDOG","ZS","CRWD","OKTA",
     "ARM","SMCI","MU","TSM","ASML","AMAT","LRCX","KLAC","ON","MRVL",
-    "DIS","PARA","WBD","CMCSA","T","VZ","TMUS","CHTR","DISH",
+    "DIS","WBD","CMCSA","T","VZ","TMUS","CHTR",
     "GS","MS","BLK","C","USB","PNC","TFC","SCHW","AXP","COF"
 ]
 
@@ -189,13 +189,13 @@ STOCK_NAMES = {
     "NOW":"ServiceNow","INTU":"Intuit","PLTR":"Palantir","SNOW":"Snowflake",
     "COIN":"Coinbase","HOOD":"Robinhood","RBLX":"Roblox","UBER":"Uber",
     "LYFT":"Lyft","ABNB":"Airbnb","DASH":"DoorDash","SPOT":"Spotify",
-    "SHOP":"Shopify","SQ":"Block","PYPL":"PayPal","SOFI":"SoFi",
+    "SHOP":"Shopify","PYPL":"PayPal","SOFI":"SoFi",
     "AFRM":"Affirm","NET":"Cloudflare","DDOG":"Datadog","ZS":"Zscaler",
     "CRWD":"CrowdStrike","OKTA":"Okta","ARM":"ARM Holdings","SMCI":"Super Micro",
     "MU":"Micron","TSM":"TSMC","ASML":"ASML","AMAT":"Applied Materials",
     "LRCX":"Lam Research","KLAC":"KLA Corp","ON":"ON Semiconductor","MRVL":"Marvell",
-    "DIS":"Disney","PARA":"Paramount","WBD":"Warner Bros","CMCSA":"Comcast",
-    "T":"AT&T","VZ":"Verizon","TMUS":"T-Mobile","CHTR":"Charter","DISH":"DISH",
+    "DIS":"Disney","WBD":"Warner Bros","CMCSA":"Comcast",
+    "T":"AT&T","VZ":"Verizon","TMUS":"T-Mobile","CHTR":"Charter",
     "GS":"Goldman Sachs","MS":"Morgan Stanley","BLK":"BlackRock","C":"Citigroup",
     "USB":"US Bancorp","PNC":"PNC Financial","TFC":"Truist","SCHW":"Charles Schwab",
     "AXP":"American Express","COF":"Capital One"
