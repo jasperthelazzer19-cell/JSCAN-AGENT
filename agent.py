@@ -1,12 +1,17 @@
 import os
+import re
 import time
 import json
+import hmac
+import hashlib
 import sqlite3
 import threading
 import requests
 import schedule
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from functools import wraps
 from flask import Flask, render_template_string, request, jsonify
 import anthropic
 import sendgrid
@@ -17,7 +22,6 @@ import yfinance as yf
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
 SENDGRID_KEY    = os.environ.get("SENDGRID_KEY", "")
 NEWSAPI_KEY     = os.environ.get("NEWSAPI_KEY", "")
-POLYGON_KEY     = os.environ.get("POLYGON_KEY", "")
 ALPACA_KEY      = os.environ.get("ALPACA_KEY", "")
 ALPACA_SECRET   = os.environ.get("ALPACA_SECRET", "")
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
@@ -28,12 +32,133 @@ X_ACCESS_TOKEN  = os.environ.get("X_ACCESS_TOKEN", "")
 X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
 DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
+ADMIN_API_KEY   = os.environ.get("ADMIN_API_KEY", "")
+UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://jscan-agent.up.railway.app")
 
 DB_PATH = "/app/data/agent.db"
 MAX_WORKERS = 10
 
 # Module-level singleton — thread-safe, reused across all agent calls
 ANTHROPIC = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# ─── TOKEN USAGE TRACKING ─────────────────────────────────
+_usage_lock = threading.Lock()
+_usage_totals = {"input": 0, "output": 0, "cache_create": 0, "cache_read": 0}
+
+def reset_usage():
+    with _usage_lock:
+        for k in _usage_totals:
+            _usage_totals[k] = 0
+
+def record_usage(usage):
+    if not usage:
+        return
+    with _usage_lock:
+        _usage_totals["input"] += getattr(usage, "input_tokens", 0) or 0
+        _usage_totals["output"] += getattr(usage, "output_tokens", 0) or 0
+        _usage_totals["cache_create"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+        _usage_totals["cache_read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
+
+def usage_summary():
+    with _usage_lock:
+        u = dict(_usage_totals)
+    # Rough cost estimate. Mostly Haiku 4.5 calls + Sonnet 4.5 portfolio_manager.
+    # Blended approximation: $1.50/Mtok in, $7.50/Mtok out, $3.75/Mtok cache write, $0.30/Mtok cache read
+    cost = (
+        u["input"] / 1_000_000 * 1.50
+        + u["output"] / 1_000_000 * 7.50
+        + u["cache_create"] / 1_000_000 * 3.75
+        + u["cache_read"] / 1_000_000 * 0.30
+    )
+    return f"in={u['input']:,} out={u['output']:,} cache_w={u['cache_create']:,} cache_r={u['cache_read']:,} ~${cost:.3f}"
+
+# ─── ANTHROPIC CALL WITH RETRY ────────────────────────────
+def claude_call(model, max_tokens, messages, system=None, max_attempts=3):
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
+            if system is not None:
+                kwargs["system"] = system
+            msg = ANTHROPIC.messages.create(**kwargs)
+            record_usage(getattr(msg, "usage", None))
+            return msg
+        except Exception as e:
+            last_exc = e
+            if attempt < max_attempts - 1:
+                sleep_s = 2 ** attempt  # 1s, 2s, 4s
+                print(f"  Anthropic retry {attempt + 1}/{max_attempts} in {sleep_s}s after error: {e}")
+                time.sleep(sleep_s)
+    raise last_exc
+
+# ─── MARKET HOURS ─────────────────────────────────────────
+_market_clock_lock = threading.Lock()
+_market_clock_cache = {"checked_at": 0.0, "open": None}
+
+def is_market_open():
+    """Check Alpaca clock; cached 60s. Returns False on error (fail closed)."""
+    with _market_clock_lock:
+        now = time.time()
+        if _market_clock_cache["open"] is not None and now - _market_clock_cache["checked_at"] < 60:
+            return _market_clock_cache["open"]
+    try:
+        r = requests.get(
+            f"{ALPACA_BASE_URL}/v2/clock",
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            timeout=5
+        )
+        is_open = bool(r.json().get("is_open"))
+    except Exception as e:
+        print(f"  Market clock check failed: {e}")
+        is_open = False
+    with _market_clock_lock:
+        _market_clock_cache["checked_at"] = time.time()
+        _market_clock_cache["open"] = is_open
+    return is_open
+
+# ─── UNSUBSCRIBE ──────────────────────────────────────────
+def unsubscribe_token(email):
+    secret = UNSUBSCRIBE_SECRET or "fallback-not-secure"
+    return hmac.new(secret.encode(), email.encode(), hashlib.sha256).hexdigest()[:32]
+
+def verify_unsubscribe_token(email, token):
+    return hmac.compare_digest(unsubscribe_token(email), token or "")
+
+def unsubscribe_link(email):
+    if not email:
+        return ""
+    token = unsubscribe_token(email)
+    return f"{PUBLIC_BASE_URL}/unsubscribe?email={email}&token={token}"
+
+# ─── EMAIL VALIDATION + RATE LIMITING ─────────────────────
+EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+_rate_lock = threading.Lock()
+_rate_history = defaultdict(deque)
+
+def check_rate_limit(ip, max_per_window=5, window_sec=300):
+    now = time.time()
+    with _rate_lock:
+        dq = _rate_history[ip]
+        while dq and dq[0] < now - window_sec:
+            dq.popleft()
+        if len(dq) >= max_per_window:
+            return False
+        dq.append(now)
+        return True
+
+# ─── AUTH ─────────────────────────────────────────────────
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_API_KEY:
+            return jsonify({"error": "ADMIN_API_KEY not configured on server"}), 500
+        provided = request.headers.get("X-API-Key") or request.args.get("key")
+        if provided != ADMIN_API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
 
 WATCHLIST = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","JPM","V",
@@ -141,47 +266,52 @@ def init_db():
 
 # ─── DATA FETCHING ────────────────────────────────────────
 def get_stock_data(symbols):
+    """Batch-fetch latest OHLCV for all symbols via yfinance. Returns {sym: {...}}."""
     result = {}
+    if not symbols:
+        return result
     try:
-        check_date = datetime.utcnow() - timedelta(days=1)
-        for _ in range(7):
-            if check_date.weekday() < 5:
-                break
-            check_date -= timedelta(days=1)
-        date_str = check_date.strftime("%Y-%m-%d")
-        print(f"  Fetching Polygon data for date: {date_str} (weekday: {check_date.weekday()})")
-
-        r = requests.get(
-            f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}",
-            params={"adjusted": "true", "apiKey": POLYGON_KEY},
-            timeout=20
+        df = yf.download(
+            tickers=symbols,
+            period="5d",
+            auto_adjust=True,
+            group_by="ticker",
+            threads=True,
+            progress=False
         )
-        data = r.json()
-        result_count = len(data.get("results", []))
-        print(f"  Polygon returned {result_count} results for {date_str} (status: {r.status_code})")
+        if df is None or df.empty:
+            print(f"  yfinance returned empty for {len(symbols)} symbols")
+            return result
+        print(f"  yfinance: fetched batch for {len(symbols)} symbols")
 
-        if result_count == 0:
-            print(f"  WARNING: Polygon returned 0 results. Response: {str(data)[:200]}")
-
-        bars = {b["T"]: b for b in data.get("results", [])}
         for sym in symbols:
-            poly_sym = sym.replace("-", ".")
-            bar = bars.get(poly_sym) or bars.get(sym)
-            if bar:
-                c = float(bar.get("c", 0))
-                o = float(bar.get("o", 0))
-                h = float(bar.get("h", 0))
-                l = float(bar.get("l", 0))
-                v = int(bar.get("v", 0))
-                chg = round(((c - o) / o) * 100, 2) if o else 0
-                result[sym] = {
-                    "price": round(c, 2),
-                    "open": round(o, 2),
-                    "high": round(h, 2),
-                    "low": round(l, 2),
-                    "volume": v,
-                    "change_pct": chg
-                }
+            try:
+                sub = df[sym].dropna(how="all")
+            except (KeyError, ValueError):
+                continue
+            if sub.empty:
+                continue
+            last = sub.iloc[-1]
+            try:
+                o = float(last["Open"])
+                h = float(last["High"])
+                l = float(last["Low"])
+                c = float(last["Close"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not (o == o and h == h and l == l and c == c):  # any NaN
+                continue
+            v_raw = last.get("Volume", 0)
+            v = int(v_raw) if v_raw == v_raw else 0
+            chg = round(((c - o) / o) * 100, 2) if o else 0
+            result[sym] = {
+                "price": round(c, 2),
+                "open": round(o, 2),
+                "high": round(h, 2),
+                "low": round(l, 2),
+                "volume": v,
+                "change_pct": chg
+            }
     except Exception as e:
         print(f"Stock data error: {e}")
     return result
@@ -261,7 +391,7 @@ def get_alpaca_account():
     except:
         return {}
 
-WEEKLY_BUDGET = 10000  # $10k paper money per week
+WEEKLY_BUDGET = int(os.environ.get("WEEKLY_BUDGET", "10000"))
 
 def get_weekly_budget_remaining():
     conn = sqlite3.connect(DB_PATH)
@@ -334,32 +464,48 @@ def save_call(symbol, flag, price, thesis):
     conn.close()
 
 # ─── SELF-LEARNING ────────────────────────────────────────
+def get_close_on_or_after(symbol, date_str):
+    """Close on date_str, or next available trading day within 7 days."""
+    try:
+        start = datetime.strptime(date_str, "%Y-%m-%d")
+        end = start + timedelta(days=7)
+        hist = yf.Ticker(symbol).history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=True
+        )
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[0])
+    except Exception:
+        return None
+
 def score_past_calls():
+    """For each unscored call at horizon N, fetch the actual close on call_date+N
+    (or next trading day) and record outcome. Only scores when outcome date is in the past."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     scored = 0
+    today = datetime.utcnow().date()
 
-    for days_back in [1, 7, 30]:
-        target_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    for days_later in [1, 7, 30]:
         c.execute("""
-            SELECT id, symbol, flag, price FROM calls
-            WHERE date = ? AND id NOT IN (
-                SELECT call_id FROM call_results WHERE days_later = ?
-            )
-        """, (target_date, days_back))
-        old_calls = c.fetchall()
+            SELECT id, symbol, flag, price, date FROM calls
+            WHERE id NOT IN (SELECT call_id FROM call_results WHERE days_later = ?)
+        """, (days_later,))
+        rows = c.fetchall()
 
-        if not old_calls:
-            continue
-
-        symbols = [r[1] for r in old_calls]
-        current_prices = get_stock_data(symbols)
-
-        for call_id, symbol, flag, price_then in old_calls:
-            if symbol not in current_prices:
+        for call_id, symbol, flag, price_then, call_date_str in rows:
+            try:
+                cd = datetime.strptime(call_date_str, "%Y-%m-%d").date()
+            except (TypeError, ValueError):
                 continue
-            price_now = current_prices[symbol]["price"]
-            if not price_then or not price_now:
+            outcome_date = cd + timedelta(days=days_later)
+            if outcome_date >= today:
+                # Outcome window hasn't fully closed yet — wait for tomorrow's run
+                continue
+            price_now = get_close_on_or_after(symbol, outcome_date.strftime("%Y-%m-%d"))
+            if price_now is None or not price_then:
                 continue
             change_pct = round(((price_now - price_then) / price_then) * 100, 2)
 
@@ -373,7 +519,7 @@ def score_past_calls():
             c.execute("""
                 INSERT INTO call_results (call_id, days_later, price_then, price_change_pct, outcome)
                 VALUES (?, ?, ?, ?, ?)
-            """, (call_id, days_back, price_now, change_pct, outcome))
+            """, (call_id, days_later, price_now, change_pct, outcome))
             scored += 1
 
     conn.commit()
@@ -449,17 +595,13 @@ def get_stock_history(symbol):
 
 def get_market_regime():
     try:
-        spy = requests.get(
-            f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2020-01-01/{datetime.utcnow().strftime('%Y-%m-%d')}",
-            params={"apiKey": POLYGON_KEY, "limit": 10, "sort": "desc"},
-            timeout=6
-        ).json().get("results", [])
-
-        if len(spy) < 5:
+        spy = yf.Ticker("SPY").history(period="10d", auto_adjust=True)
+        if spy is None or len(spy) < 5:
             return ""
-
-        recent = spy[0]["c"]
-        week_ago = spy[4]["c"]
+        recent = float(spy["Close"].iloc[-1])
+        week_ago = float(spy["Close"].iloc[-5])
+        if not week_ago:
+            return ""
         spy_5d_change = round(((recent - week_ago) / week_ago) * 100, 2)
 
         if spy_5d_change > 2:
@@ -473,7 +615,7 @@ def get_market_regime():
             note = "Market range-bound. Stick to high-conviction signals only."
 
         return f"\nMARKET REGIME: {regime} (SPY 5d: {spy_5d_change:+.2f}%) - {note}"
-    except:
+    except Exception:
         return ""
 
 # ─── CLAUDE ANALYSIS ──────────────────────────────────────
@@ -564,7 +706,7 @@ KEY_CATALYST: [single most important news item, or "None" if no significant news
 RISK_FLAG: [any major risks mentioned in news, or "None"]
 SUMMARY: [1 sentence summary of news sentiment]"""
 
-    msg = ANTHROPIC.messages.create(
+    msg = claude_call(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
@@ -635,7 +777,7 @@ RSI_SIGNAL: [OVERBOUGHT / NEUTRAL / OVERSOLD]
 STRENGTH_SCORE: [number from -10 to +10]
 SUMMARY: [1 sentence technical assessment that incorporates the MA and RSI context]"""
 
-    msg = ANTHROPIC.messages.create(
+    msg = claude_call(
         model="claude-haiku-4-5-20251001",
         max_tokens=250,
         messages=[{"role": "user", "content": prompt}]
@@ -661,7 +803,7 @@ RELATIVE_STRENGTH: [OUTPERFORMING / IN_LINE / UNDERPERFORMING]
 MACRO_SCORE: [number from -10 to +10]
 SUMMARY: [1 sentence macro/sentiment assessment]"""
 
-    msg = ANTHROPIC.messages.create(
+    msg = claude_call(
         model="claude-haiku-4-5-20251001",
         max_tokens=150,
         messages=[{"role": "user", "content": prompt}]
@@ -735,7 +877,7 @@ Price: ${price_data.get('price')} | Change: {price_data.get('change_pct')}%
 
 Make your decision now."""
 
-    msg = ANTHROPIC.messages.create(
+    msg = claude_call(
         model="claude-sonnet-4-5",
         max_tokens=500,
         system=[
@@ -793,10 +935,12 @@ def parse_analysis(text):
     return result
 
 # ─── EMAIL BUILDER ────────────────────────────────────────
-def build_email(analyses, account):
+def build_email(analyses, account, email=None):
     today = datetime.utcnow().strftime("%A, %B %d, %Y")
     portfolio_val = account.get("portfolio_value", "N/A")
     cash = account.get("cash", "N/A")
+    unsub = unsubscribe_link(email)
+    unsub_html = f'<div style="text-align:center;color:#444;font-size:11px;margin-top:8px"><a href="{unsub}" style="color:#666;text-decoration:underline">Unsubscribe</a></div>' if unsub else ""
 
     green = [a for a in analyses if a["flag"] == "GREEN"]
     yellow = [a for a in analyses if a["flag"] == "YELLOW"]
@@ -873,17 +1017,20 @@ def build_email(analyses, account):
     <div style="color:#333;font-size:12px;text-align:center;padding-top:16px;border-top:1px solid #1a1a1a">
       JSCAN AI Agent · Paper trading only · Not financial advice · Powered by Claude AI
     </div>
+    {unsub_html}
   </div>
 </body>
 </html>"""
     return html
 
 
-def build_free_email(analyses, account):
+def build_free_email(analyses, account, email=None):
     today = datetime.utcnow().strftime("%A, %B %d, %Y")
     green = [a for a in analyses if a["flag"] == "GREEN"]
     red = [a for a in analyses if a["flag"] == "RED"]
     yellow = [a for a in analyses if a["flag"] == "YELLOW"]
+    unsub = unsubscribe_link(email)
+    unsub_html = f'<div style="text-align:center;color:#444;font-size:11px;margin-top:8px"><a href="{unsub}" style="color:#666;text-decoration:underline">Unsubscribe</a></div>' if unsub else ""
 
     def flag_color(f):
         return {"GREEN": "#00cc66", "YELLOW": "#f0c040", "RED": "#ff4444"}.get(f, "#888")
@@ -946,6 +1093,7 @@ def build_free_email(analyses, account):
     <div style="text-align:center;color:#333;font-size:12px">
       JSCAN AI Agent · Paper trading only · Not financial advice
     </div>
+    {unsub_html}
   </div>
 </body>
 </html>"""
@@ -981,24 +1129,32 @@ def analyze_one_stock(sym, price_data_all, previous_calls, positions, track_reco
 
     action = parsed["action"].upper()
     if "BUY" in action and parsed["flag"] == "GREEN":
-        price = pd["price"]
-        if price and price > 0:
-            with budget_lock:
-                remaining = get_weekly_budget_remaining()
-                if remaining > 0:
-                    budget_per = min(budget_state["per_position"], remaining)
-                    qty = max(1, int(budget_per / price))
-                    cost = round(qty * price, 2)
-                    if cost <= remaining:
-                        result = place_paper_trade(sym, "buy", qty)
-                        if "error" not in result:
-                            record_budget_deployment(cost, budget_state["portfolio_val"])
-                            budget_state["total_deployed"] += cost
-                        print(f"    Paper BUY {qty}x {sym} @ ${price} = ${cost}: {result.get('status', result.get('error', 'unknown'))}")
+        if sym in positions:
+            print(f"    Skip BUY {sym} — already hold {positions[sym].get('qty')} shares")
+        elif not is_market_open():
+            print(f"    Skip BUY {sym} — market closed")
+        else:
+            price = pd["price"]
+            if price and price > 0:
+                with budget_lock:
+                    remaining = get_weekly_budget_remaining()
+                    if remaining > 0:
+                        budget_per = min(budget_state["per_position"], remaining)
+                        qty = max(1, int(budget_per / price))
+                        cost = round(qty * price, 2)
+                        if cost <= remaining:
+                            result = place_paper_trade(sym, "buy", qty)
+                            if "error" not in result:
+                                record_budget_deployment(cost, budget_state["portfolio_val"])
+                                budget_state["total_deployed"] += cost
+                            print(f"    Paper BUY {qty}x {sym} @ ${price} = ${cost}: {result.get('status', result.get('error', 'unknown'))}")
     elif "SELL" in action and sym in positions:
-        qty = positions[sym].get("qty", 1)
-        result = place_paper_trade(sym, "sell", qty)
-        print(f"    Paper SELL {qty}x {sym}: {result.get('status', result.get('error', 'unknown'))}")
+        if not is_market_open():
+            print(f"    Skip SELL {sym} — market closed")
+        else:
+            qty = positions[sym].get("qty", 1)
+            result = place_paper_trade(sym, "sell", qty)
+            print(f"    Paper SELL {qty}x {sym}: {result.get('status', result.get('error', 'unknown'))}")
 
     return parsed
 
@@ -1010,12 +1166,40 @@ def run_agent(symbols=None, force=False):
     if symbols is None:
         symbols = WATCHLIST
     print(f"[{datetime.utcnow()}] Agent running for {len(symbols)} stocks (parallel x{MAX_WORKERS})...")
+    reset_usage()
 
     price_data = get_stock_data(symbols)
+    if not price_data:
+        print(f"[{datetime.utcnow()}] No price data — aborting run, no emails sent.")
+        return []
+
     positions = get_alpaca_positions()
     account = get_alpaca_account()
     previous_calls = get_previous_calls()
     portfolio_val = float(account.get("portfolio_value", 0))
+
+    # Stop-loss pass: sell anything down >= 5% from entry
+    print("  Checking stop-loss conditions...")
+    stop_loss_sold = []
+    for sym, p in list(positions.items()):
+        try:
+            avg_entry = float(p.get("avg_entry_price", 0))
+            current = float(p.get("current_price", 0)) or avg_entry
+            if avg_entry <= 0:
+                continue
+            pl_pct = ((current - avg_entry) / avg_entry) * 100
+            if pl_pct <= -5.0:
+                qty = p.get("qty", 1)
+                if is_market_open():
+                    result = place_paper_trade(sym, "sell", qty)
+                    print(f"    STOP-LOSS sell {qty}x {sym} @ ${current} (down {pl_pct:.2f}%): {result.get('status', result.get('error', 'unknown'))}")
+                    stop_loss_sold.append(sym)
+                else:
+                    print(f"    STOP-LOSS triggered for {sym} (down {pl_pct:.2f}%) but market closed; will sell next open")
+        except Exception as e:
+            print(f"    Stop-loss check error for {sym}: {e}")
+    if stop_loss_sold:
+        positions = get_alpaca_positions()  # refresh after sells
 
     budget_remaining = get_weekly_budget_remaining()
     per_position = round(min(budget_remaining / 20, 500), 2)
@@ -1085,9 +1269,9 @@ def run_agent(symbols=None, force=False):
                 greens = [a for a in user_analyses if a["flag"] == "GREEN"][:3]
                 reds = [a for a in user_analyses if a["flag"] == "RED"][:3]
                 yellows = [a for a in user_analyses if a["flag"] == "YELLOW"][:2]
-                user_html = build_free_email(greens + reds + yellows, account)
+                user_html = build_free_email(greens + reds + yellows, account, email=email)
             else:
-                user_html = build_email(user_analyses, account)
+                user_html = build_email(user_analyses, account, email=email)
 
             message = Mail(
                 from_email=FROM_EMAIL,
@@ -1101,6 +1285,7 @@ def run_agent(symbols=None, force=False):
             print(f"  Email error for {email}: {e}")
 
     print(f"[{datetime.utcnow()}] Agent done. Analyzed {len(analyses)} stocks.")
+    print(f"  Claude usage: {usage_summary()}")
 
     # Marketing runs in background so it doesn't block the schedule thread
     threading.Thread(target=run_marketing, args=(analyses,), daemon=True).start()
@@ -1182,7 +1367,7 @@ Rules:
 - Max 2 hashtags
 - Be specific about the signal"""
 
-    msg = ANTHROPIC.messages.create(
+    msg = claude_call(
         model="claude-haiku-4-5-20251001",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}]
@@ -1334,23 +1519,64 @@ def index():
 
 @app.route("/subscribe", methods=["POST"])
 def subscribe():
-    data = request.json
-    email = data.get("email", "").strip()
-    stocks = data.get("stocks", [])
-    if not email or not stocks:
-        return jsonify({"success": False, "error": "Missing email or stocks"})
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    if "," in ip:  # X-Forwarded-For can be a comma-separated chain
+        ip = ip.split(",")[0].strip()
+    if not check_rate_limit(ip):
+        return jsonify({"success": False, "error": "Too many requests, try again later"}), 429
+
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
+    stocks = data.get("stocks") or []
+
+    if not email or not EMAIL_REGEX.match(email):
+        return jsonify({"success": False, "error": "Invalid email address"}), 400
+    if not isinstance(stocks, list) or not stocks:
+        return jsonify({"success": False, "error": "Please select at least one stock"}), 400
+    if len(stocks) > 200:
+        return jsonify({"success": False, "error": "Too many stocks selected"}), 400
+
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO subscribers (email, stocks) VALUES (?, ?)",
+        # Upsert that preserves `paid` on existing rows
+        c.execute("""INSERT INTO subscribers (email, stocks, active)
+                     VALUES (?, ?, 1)
+                     ON CONFLICT(email) DO UPDATE SET
+                       stocks = excluded.stocks,
+                       active = 1""",
                   (email, json.dumps(stocks)))
         conn.commit()
         conn.close()
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/unsubscribe", methods=["GET"])
+def unsubscribe():
+    email = (request.args.get("email") or "").strip().lower()
+    token = (request.args.get("token") or "").strip()
+    if not email or not token:
+        return "Invalid unsubscribe link", 400
+    if not verify_unsubscribe_token(email, token):
+        return "Invalid or tampered unsubscribe link", 403
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE subscribers SET active=0 WHERE email=?", (email,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return f"Error: {e}", 500
+    return f"""<html><head><title>Unsubscribed</title></head>
+<body style="font-family:-apple-system,sans-serif;background:#0a0a0a;color:#e0e0e0;padding:60px;text-align:center">
+<h2 style="color:#00ff88">Unsubscribed</h2>
+<p>{email} will no longer receive JSCAN briefs.</p>
+<p style="color:#555;font-size:13px">Changed your mind? Resubscribe at <a href="{PUBLIC_BASE_URL}" style="color:#00ff88">{PUBLIC_BASE_URL}</a></p>
+</body></html>"""
 
 @app.route("/run", methods=["POST"])
+@require_auth
 def trigger_run():
     threading.Thread(target=lambda: run_agent(force=True), daemon=True).start()
     return jsonify({"success": True, "message": "Agent started in background"})
@@ -1375,6 +1601,7 @@ def status():
     })
 
 @app.route("/dashboard")
+@require_auth
 def dashboard():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -1548,7 +1775,8 @@ function triggerRun(){{
   var btn=document.getElementById('run-btn');
   btn.disabled=true;
   btn.textContent='Running...';
-  fetch('/run',{{method:'POST'}})
+  var key=new URLSearchParams(window.location.search).get('key')||'';
+  fetch('/run',{{method:'POST',headers:{{'X-API-Key':key}}}})
     .then(function(r){{return r.json();}})
     .then(function(d){{
       btn.textContent='✓ Started';
