@@ -37,7 +37,7 @@ UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://jscan-agent.up.railway.app")
 
 DB_PATH = "/app/data/agent.db"
-MAX_WORKERS = 10
+MAX_WORKERS = 2
 
 # Module-level singleton — thread-safe, reused across all agent calls
 ANTHROPIC = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
