@@ -6,15 +6,6 @@ import requests
 import schedule
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
-
-app = Flask(__name__)
-
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return response
 import anthropic
 import sendgrid
 from sendgrid.helpers.mail import Mail
@@ -44,7 +35,7 @@ WATCHLIST = [
     "PLTR","SNOW","COIN","HOOD","RBLX","UBER","LYFT","ABNB","DASH","SPOT",
     "SHOP","SQ","PYPL","SOFI","AFRM","NET","DDOG","ZS","CRWD","OKTA",
     "ARM","SMCI","MU","TSM","ASML","AMAT","LRCX","KLAC","ON","MRVL",
-    "DIS","NFLX","PARA","WBD","CMCSA","T","VZ","TMUS","CHTR","DISH",
+    "DIS","PARA","WBD","CMCSA","T","VZ","TMUS","CHTR","DISH",
     "GS","MS","BLK","C","USB","PNC","TFC","SCHW","AXP","COF"
 ]
 
@@ -78,6 +69,13 @@ STOCK_NAMES = {
 
 app = Flask(__name__)
 
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
 # ─── DATABASE ─────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect("agent.db")
@@ -107,6 +105,12 @@ def init_db():
         outcome TEXT,
         checked_at TEXT DEFAULT CURRENT_TIMESTAMP
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS weekly_budget (
+        week TEXT PRIMARY KEY,
+        deployed REAL DEFAULT 0,
+        starting_value REAL DEFAULT 0,
+        current_value REAL DEFAULT 0
+    )""")
     conn.commit()
     conn.close()
 
@@ -114,18 +118,28 @@ def init_db():
 def get_stock_data(symbols):
     result = {}
     try:
-        check_date = datetime.now() - timedelta(days=1)
+        # Walk back from yesterday to find the most recent trading day
+        check_date = datetime.utcnow() - timedelta(days=1)
         for _ in range(7):
-            if check_date.weekday() < 5:
+            if check_date.weekday() < 5:  # 0=Mon, 4=Fri
                 break
             check_date -= timedelta(days=1)
         date_str = check_date.strftime("%Y-%m-%d")
+        print(f"  Fetching Polygon data for date: {date_str} (weekday: {check_date.weekday()})")
+
         r = requests.get(
             f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}",
             params={"adjusted": "true", "apiKey": POLYGON_KEY},
             timeout=20
         )
-        bars = {b["T"]: b for b in r.json().get("results", [])}
+        data = r.json()
+        result_count = len(data.get("results", []))
+        print(f"  Polygon returned {result_count} results for {date_str} (status: {r.status_code})")
+
+        if result_count == 0:
+            print(f"  WARNING: Polygon returned 0 results. Response: {str(data)[:200]}")
+
+        bars = {b["T"]: b for b in data.get("results", [])}
         for sym in symbols:
             poly_sym = sym.replace("-", ".")
             bar = bars.get(poly_sym) or bars.get(sym)
@@ -191,18 +205,9 @@ def get_alpaca_account():
 WEEKLY_BUDGET = 10000  # $10k paper money per week
 
 def get_weekly_budget_remaining():
-    """Track how much of this week's budget has been deployed."""
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    # Create budget table if not exists
-    c.execute("""CREATE TABLE IF NOT EXISTS weekly_budget (
-        week TEXT PRIMARY KEY,
-        deployed REAL DEFAULT 0,
-        starting_value REAL DEFAULT 0,
-        current_value REAL DEFAULT 0
-    )""")
-    conn.commit()
-    week = datetime.now().strftime("%Y-W%W")
+    week = datetime.utcnow().strftime("%Y-W%W")
     c.execute("SELECT deployed FROM weekly_budget WHERE week = ?", (week,))
     row = c.fetchone()
     conn.close()
@@ -211,10 +216,9 @@ def get_weekly_budget_remaining():
     return max(0, WEEKLY_BUDGET - row[0])
 
 def record_budget_deployment(amount, portfolio_value):
-    """Record money deployed this week."""
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    week = datetime.now().strftime("%Y-W%W")
+    week = datetime.utcnow().strftime("%Y-W%W")
     c.execute("""INSERT INTO weekly_budget (week, deployed, starting_value, current_value)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(week) DO UPDATE SET
@@ -225,21 +229,29 @@ def record_budget_deployment(amount, portfolio_value):
     conn.close()
 
 def get_portfolio_history():
-    """Get weekly portfolio performance for display."""
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS weekly_budget (week TEXT PRIMARY KEY, deployed REAL DEFAULT 0, starting_value REAL DEFAULT 0, current_value REAL DEFAULT 0)")
     c.execute("SELECT week, deployed, starting_value, current_value FROM weekly_budget ORDER BY week DESC LIMIT 12")
     rows = c.fetchall()
     conn.close()
     return [{"week": r[0], "deployed": r[1], "starting": r[2], "current": r[3]} for r in rows]
+
+def place_paper_trade(symbol, side, qty):
     try:
-        r = requests.post(
-            f"{ALPACA_BASE_URL}/v2/orders",
-            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
-            json={"symbol": symbol, "qty": qty, "side": side, "type": "market", "time_in_force": "day"},
-            timeout=8
-        )
+        url = "https://paper-api.alpaca.markets/v2/orders"
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET,
+            "Content-Type": "application/json"
+        }
+        data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day"
+        }
+        r = requests.post(url, json=data, headers=headers, timeout=10)
         return r.json()
     except Exception as e:
         return {"error": str(e)}
@@ -247,7 +259,7 @@ def get_portfolio_history():
 def get_previous_calls():
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    week_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
     c.execute("SELECT symbol, date, flag, price, thesis FROM calls WHERE date >= ? ORDER BY date DESC", (week_ago,))
     rows = c.fetchall()
     conn.close()
@@ -256,21 +268,20 @@ def get_previous_calls():
 def save_call(symbol, flag, price, thesis):
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
     c.execute("INSERT INTO calls (symbol, date, flag, price, thesis) VALUES (?, ?, ?, ?, ?)",
               (symbol, today, flag, price, thesis))
     conn.commit()
     conn.close()
 
-# ─── CLAUDE ANALYSIS ──────────────────────────────────────
+# ─── SELF-LEARNING ────────────────────────────────────────
 def score_past_calls():
-    """Score calls from 1, 7, and 30 days ago against actual price movement."""
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
     scored = 0
 
     for days_back in [1, 7, 30]:
-        target_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        target_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         c.execute("""
             SELECT id, symbol, flag, price FROM calls
             WHERE date = ? AND id NOT IN (
@@ -282,7 +293,6 @@ def score_past_calls():
         if not old_calls:
             continue
 
-        # Get current prices
         symbols = [r[1] for r in old_calls]
         current_prices = get_stock_data(symbols)
 
@@ -294,7 +304,6 @@ def score_past_calls():
                 continue
             change_pct = round(((price_now - price_then) / price_then) * 100, 2)
 
-            # Score: GREEN should go up, RED should go down, YELLOW = neutral
             if flag == "GREEN":
                 outcome = "correct" if change_pct > 0.5 else "incorrect" if change_pct < -0.5 else "neutral"
             elif flag == "RED":
@@ -314,7 +323,6 @@ def score_past_calls():
     return scored
 
 def get_track_record():
-    """Get Claude's historical accuracy stats to feed back into prompts."""
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
 
@@ -334,14 +342,13 @@ def get_track_record():
             accuracy = round((correct / total) * 100, 1)
             stats[flag] = {"accuracy": accuracy, "total": total, "correct": correct, "avg_move": avg_move}
 
-    # Sector-level accuracy
     sector_stats = {}
     sectors = {
         "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
-        "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP","SPGI"],
-        "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","PFE","BMY","GILD","AMGN","MDT","BSX","SYK","ZTS"],
-        "ENERGY": ["XOM","CVX","COP","PSX","VLO","MPC","HES","DVN","FANG","OXY","SLB","HAL"],
-        "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","TGT","NKE","SBUX","DIS","NFLX"]
+        "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP"],
+        "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","AMGN"],
+        "ENERGY": ["XOM","CVX"],
+        "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","DIS","NFLX"]
     }
     for sector, syms in sectors.items():
         placeholders = ",".join("?" * len(syms))
@@ -362,29 +369,7 @@ def get_track_record():
         stats["sectors"] = sector_stats
     return stats
 
-def place_paper_trade(symbol, side, qty):
-    """Place a paper trade via Alpaca."""
-    try:
-        url = "https://paper-api.alpaca.markets/v2/orders"
-        headers = {
-            "APCA-API-KEY-ID": ALPACA_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET,
-            "Content-Type": "application/json"
-        }
-        data = {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": side,
-            "type": "market",
-            "time_in_force": "day"
-        }
-        r = requests.post(url, json=data, headers=headers, timeout=10)
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
-
 def get_stock_history(symbol):
-    """Get this stock's specific call history to feed into the agent."""
     try:
         conn = sqlite3.connect("agent.db")
         c = conn.cursor()
@@ -411,12 +396,9 @@ def get_stock_history(symbol):
         return ""
 
 def get_market_regime():
-    """Detect current market regime using SPY and VIX data."""
     try:
-        import requests as req
-        # Get SPY 5-day trend from Polygon
-        spy = req.get(
-            f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2020-01-01/{datetime.now().strftime('%Y-%m-%d')}",
+        spy = requests.get(
+            f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2020-01-01/{datetime.utcnow().strftime('%Y-%m-%d')}",
             params={"apiKey": POLYGON_KEY, "limit": 10, "sort": "desc"},
             timeout=6
         ).json().get("results", [])
@@ -428,7 +410,6 @@ def get_market_regime():
         week_ago = spy[4]["c"]
         spy_5d_change = round(((recent - week_ago) / week_ago) * 100, 2)
 
-        # Determine regime
         if spy_5d_change > 2:
             regime = "BULL"
             note = "Market trending strongly up. GREEN calls more likely to succeed."
@@ -442,29 +423,9 @@ def get_market_regime():
         return f"\nMARKET REGIME: {regime} (SPY 5d: {spy_5d_change:+.2f}%) — {note}"
     except:
         return ""
-    """Get this stock's specific call history to feed into the agent."""
-    conn = sqlite3.connect("agent.db")
-    c = conn.cursor()
-    c.execute("""
-        SELECT ca.date, ca.flag, ca.price, cr.price_change_pct, cr.outcome
-        FROM calls ca
-        LEFT JOIN call_results cr ON ca.id = cr.call_id AND cr.days_later = 1
-        WHERE ca.symbol = ?
-        ORDER BY ca.date DESC
-        LIMIT 10
-    """, (symbol,))
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return ""
-    lines = []
-    for date, flag, price, change_pct, outcome in rows:
-        if outcome and change_pct is not None:
-            lines.append(f"  {date}: {flag} at ${price} → {change_pct:+.2f}% ({outcome.upper()})")
-        else:
-            lines.append(f"  {date}: {flag} at ${price} → pending")
-    return "\nTHIS STOCK'S HISTORY:\n" + "\n".join(lines)
-    """Agent 1: Analyzes news sentiment and identifies key catalysts."""
+
+# ─── CLAUDE ANALYSIS ──────────────────────────────────────
+def news_agent(symbol, name, news):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     news_text = "\n".join([f"- {n['title']} ({n['source']}, {n['published']})" for n in news]) or "No recent news."
     prompt = f"""You are a financial news analyst. Analyze recent news for {name} ({symbol}).
@@ -486,7 +447,6 @@ SUMMARY: [1 sentence summary of news sentiment]"""
     return msg.content[0].text
 
 def technical_agent(symbol, name, price_data):
-    """Agent 2: Analyzes price action and technical indicators."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     price = price_data.get("price", 0)
     open_p = price_data.get("open", 0)
@@ -495,7 +455,6 @@ def technical_agent(symbol, name, price_data):
     volume = price_data.get("volume", 0)
     change_pct = price_data.get("change_pct", 0)
 
-    # Calculate basic technicals
     day_range = high - low if high and low else 0
     range_position = ((price - low) / day_range * 100) if day_range > 0 else 50
     body_size = abs(price - open_p) / open_p * 100 if open_p else 0
@@ -524,10 +483,8 @@ SUMMARY: [1 sentence technical assessment]"""
     return msg.content[0].text
 
 def sentiment_agent(symbol, name, price_data, all_prices):
-    """Agent 3: Analyzes macro environment and sector sentiment."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-    # Calculate sector context from all prices
     changes = [v.get("change_pct", 0) for v in all_prices.values() if v.get("change_pct") is not None]
     market_avg = round(sum(changes) / len(changes), 2) if changes else 0
     stock_change = price_data.get("change_pct", 0)
@@ -554,7 +511,6 @@ SUMMARY: [1 sentence macro/sentiment assessment]"""
     return msg.content[0].text
 
 def portfolio_manager(symbol, price_data, news_report, technical_report, sentiment_report, previous_calls, positions, track_record):
-    """Agent 4: Synthesizes all reports and makes final call. Uses Sonnet for better decisions."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     name = STOCK_NAMES.get(symbol, symbol)
 
@@ -577,31 +533,29 @@ def portfolio_manager(symbol, price_data, news_report, technical_report, sentime
         parts = []
         for flag in ["GREEN", "RED", "YELLOW"]:
             stats = track_record.get(flag, {})
-            if stats.get("total", 0) >= 3:
+            if isinstance(stats, dict) and stats.get("total", 0) >= 3:
                 parts.append(f"{flag}: {stats['accuracy']}% accurate ({stats['total']} calls, avg move {stats.get('avg_move', 0)}%)")
         if parts:
             track_text = "\nYOUR TRACK RECORD (last 24h scoring):\n" + "\n".join(parts)
 
-        # Add sector bias
         sectors = track_record.get("sectors", {})
         if sectors:
             best = max(sectors, key=sectors.get)
             worst = min(sectors, key=sectors.get)
             if sectors[best] != sectors[worst]:
                 track_text += f"\nSECTOR ACCURACY: Best in {best} ({sectors[best]}%), weakest in {worst} ({sectors[worst]}%)"
-                # Determine which sector this stock is in
                 sym_sectors = {
                     "TECH": ["AAPL","MSFT","NVDA","GOOGL","META","AMD","INTC","QCOM","ADBE","CRM","NOW","ORCL","CSCO","SNOW","PLTR","DDOG","NET","CRWD"],
-                    "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP","SPGI"],
-                    "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","PFE","BMY","GILD","AMGN","MDT","BSX","SYK","ZTS"],
-                    "ENERGY": ["XOM","CVX","COP","PSX","VLO","MPC","HES","DVN","FANG","OXY","SLB","HAL"],
-                    "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","TGT","NKE","SBUX","DIS","NFLX"]
+                    "FINANCE": ["JPM","BAC","WFC","GS","MS","V","MA","C","USB","PNC","SCHW","BLK","AXP"],
+                    "HEALTH": ["UNH","LLY","JNJ","MRK","ABBV","AMGN"],
+                    "ENERGY": ["XOM","CVX"],
+                    "CONSUMER": ["AMZN","TSLA","WMT","HD","MCD","COST","LOW","DIS","NFLX"]
                 }
                 for sec, syms in sym_sectors.items():
                     if symbol in syms and sec in sectors:
                         acc = sectors[sec]
                         if acc < 45:
-                            track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is only {acc}% — be more cautious with this call."
+                            track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is only {acc}% — be more cautious."
                         elif acc > 65:
                             track_text += f"\nNOTE: {symbol} is in {sec} sector where accuracy is {acc}% — high confidence sector."
                         break
@@ -633,7 +587,7 @@ FLAG: [GREEN / YELLOW / RED]
 BULL CASE: [1-2 sentences]
 BEAR CASE: [1-2 sentences]
 VERDICT: [1-2 sentences — your final call with conviction]
-ACTION: [BUY / HOLD / SELL / WATCH] [optional qty e.g. "BUY 5 shares"]
+ACTION: [BUY / HOLD / SELL / WATCH]
 CONFIDENCE: [HIGH / MEDIUM / LOW]"""
 
     msg = client.messages.create(
@@ -644,7 +598,6 @@ CONFIDENCE: [HIGH / MEDIUM / LOW]"""
     return msg.content[0].text
 
 def analyze_stock(symbol, price_data, news, previous_calls, positions, track_record=None, all_prices=None):
-    """Multi-agent analysis: runs 4 specialized agents then synthesizes."""
     name = STOCK_NAMES.get(symbol, symbol)
     if all_prices is None:
         all_prices = {symbol: price_data}
@@ -690,7 +643,7 @@ def parse_analysis(text):
 
 # ─── EMAIL BUILDER ────────────────────────────────────────
 def build_email(analyses, account):
-    today = datetime.now().strftime("%A, %B %d, %Y")
+    today = datetime.utcnow().strftime("%A, %B %d, %Y")
     portfolio_val = account.get("portfolio_value", "N/A")
     cash = account.get("cash", "N/A")
 
@@ -726,14 +679,10 @@ def build_email(analyses, account):
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="background:#0a0a0a;color:#e0e0e0;font-family:'Helvetica Neue',Arial,sans-serif;margin:0;padding:0">
   <div style="max-width:900px;margin:0 auto;padding:32px 20px">
-
-    <!-- Header -->
     <div style="border-bottom:1px solid #1c1c1c;padding-bottom:20px;margin-bottom:28px">
       <div style="font-size:24px;font-weight:800;color:#00ff88;letter-spacing:-0.5px">📊 JSCAN Daily Brief</div>
       <div style="color:#555;font-size:13px;margin-top:4px">{today}</div>
     </div>
-
-    <!-- Portfolio Summary -->
     <div style="display:flex;gap:12px;margin-bottom:28px">
       <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;padding:16px 20px;flex:1">
         <div style="font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Paper Portfolio</div>
@@ -752,13 +701,8 @@ def build_email(analyses, account):
         </div>
       </div>
     </div>
-
-    <!-- Top Picks -->
     {"<div style='background:#0d0d0d;border:1px solid #00cc6633;border-radius:10px;padding:20px;margin-bottom:20px'><div style='font-size:13px;color:#00cc66;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:14px'>🟢 Green Signals — Bullish</div>" + "".join([f"<div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1a1a1a'><span style='font-weight:700;color:#fff'>{a['symbol']}</span> <span style='color:#aaa;font-size:13px'>({a['name']})</span> — <span style='color:#ccc;font-size:13px'>{a['verdict']}</span></div>" for a in green]) + "</div>" if green else ""}
-
     {"<div style='background:#0d0d0d;border:1px solid #ff444433;border-radius:10px;padding:20px;margin-bottom:20px'><div style='font-size:13px;color:#ff4444;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:14px'>🔴 Red Signals — Bearish</div>" + "".join([f"<div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1a1a1a'><span style='font-weight:700;color:#fff'>{a['symbol']}</span> <span style='color:#aaa;font-size:13px'>({a['name']})</span> — <span style='color:#ccc;font-size:13px'>{a['verdict']}</span></div>" for a in red]) + "</div>" if red else ""}
-
-    <!-- Full Table -->
     <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;overflow:hidden;margin-bottom:28px">
       <div style="padding:16px 20px;border-bottom:1px solid #1c1c1c">
         <div style="font-size:13px;color:#555;text-transform:uppercase;letter-spacing:1px;font-weight:600">Full Watchlist Analysis</div>
@@ -775,8 +719,6 @@ def build_email(analyses, account):
         {rows}
       </table>
     </div>
-
-    <!-- Footer -->
     <div style="color:#333;font-size:12px;text-align:center;padding-top:16px;border-top:1px solid #1a1a1a">
       JSCAN AI Agent · Paper trading only · Not financial advice · Powered by Claude AI
     </div>
@@ -787,7 +729,7 @@ def build_email(analyses, account):
 
 
 def build_free_email(analyses, account):
-    today = datetime.now().strftime("%A, %B %d, %Y")
+    today = datetime.utcnow().strftime("%A, %B %d, %Y")
     green = [a for a in analyses if a["flag"] == "GREEN"]
     red = [a for a in analyses if a["flag"] == "RED"]
     yellow = [a for a in analyses if a["flag"] == "YELLOW"]
@@ -823,7 +765,6 @@ def build_free_email(analyses, account):
       <div style="font-size:28px;font-weight:800;color:#00ff88;letter-spacing:-1px">JSCAN</div>
       <div style="color:#555;font-size:13px;margin-top:4px">Daily Brief (Free) — {today}</div>
     </div>
-
     <div style="background:#111;border:1px solid #1c1c1c;border-radius:12px;padding:16px;margin-bottom:20px;text-align:center">
       <div style="color:#888;font-size:12px;margin-bottom:8px">TOP SIGNALS TODAY</div>
       <div style="display:flex;justify-content:center;gap:24px">
@@ -832,7 +773,6 @@ def build_free_email(analyses, account):
         <div><span style="font-size:20px;font-weight:700;color:#ff4444">{len(red)}</span><span style="font-size:18px"> 🔴</span></div>
       </div>
     </div>
-
     <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:12px;overflow:hidden;margin-bottom:20px">
       <table style="width:100%;border-collapse:collapse">
         <thead>
@@ -847,13 +787,11 @@ def build_free_email(analyses, account):
         <tbody>{rows}</tbody>
       </table>
     </div>
-
     <div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:20px">
       <div style="color:#00cc66;font-weight:700;font-size:15px;margin-bottom:8px">Want full analysis + thesis for all 100 stocks?</div>
       <div style="color:#888;font-size:13px;margin-bottom:16px">Upgrade to see why each signal was called, sector breakdowns, and full AI reasoning.</div>
-      <a href="https://jscan-agent.up.railway.app" style="background:#00ff88;color:#000;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">Upgrade — $5/month</a>
+      <a href="https://jscan-agent.up.railway.app" style="background:#00ff88;color:#000;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">Upgrade — $10/month</a>
     </div>
-
     <div style="text-align:center;color:#333;font-size:12px">
       JSCAN AI Agent · Paper trading only · Not financial advice
     </div>
@@ -864,13 +802,12 @@ def build_free_email(analyses, account):
 
 # ─── MAIN AGENT RUN ───────────────────────────────────────
 def run_agent(symbols=None, force=False):
-    # Skip weekends unless forced (manual run from dashboard)
-    if not force and datetime.now().weekday() >= 5:
-        print(f"[{datetime.now()}] Skipping — weekend, markets closed.")
+    if not force and datetime.utcnow().weekday() >= 5:
+        print(f"[{datetime.utcnow()}] Skipping — weekend, markets closed.")
         return []
     if symbols is None:
         symbols = WATCHLIST
-    print(f"[{datetime.now()}] Agent running for {len(symbols)} stocks...")
+    print(f"[{datetime.utcnow()}] Agent running for {len(symbols)} stocks...")
 
     price_data = get_stock_data(symbols)
     positions = get_alpaca_positions()
@@ -878,13 +815,10 @@ def run_agent(symbols=None, force=False):
     previous_calls = get_previous_calls()
     portfolio_val = float(account.get("portfolio_value", 0))
 
-    # Pre-calculate budget (will be divided by GREEN signals after analysis)
-    # For now use a reasonable default, recalculate after we know green count
     budget_remaining = get_weekly_budget_remaining()
-    per_position = round(budget_remaining / 10, 2)  # assume ~10 green signals initially
+    per_position = round(budget_remaining / 10, 2)
     total_deployed = 0
 
-    # Score past calls and get track record for self-improvement
     print("  Scoring past calls...")
     score_past_calls()
     track_record = get_track_record()
@@ -916,12 +850,10 @@ def run_agent(symbols=None, force=False):
             analyses.append(parsed)
             save_call(sym, parsed["flag"], pd["price"], parsed["verdict"])
 
-            # Paper trade if Claude says BUY or SELL — budget based sizing
             action = parsed["action"].upper()
             if "BUY" in action and parsed["flag"] == "GREEN":
                 price = pd["price"]
                 if price and price > 0:
-                    # Calculate shares based on budget allocation
                     budget_per = min(per_position, get_weekly_budget_remaining())
                     qty = max(1, int(budget_per / price))
                     cost = round(qty * price, 2)
@@ -937,9 +869,8 @@ def run_agent(symbols=None, force=False):
 
         except Exception as e:
             print(f"  Error analyzing {sym}: {e}")
-        time.sleep(0.5)  # avoid rate limiting
+        time.sleep(0.5)
 
-    # Recalculate per_position now that we know actual green count
     green_signals = [a for a in analyses if a["flag"] == "GREEN"]
     if green_signals:
         per_position = round(budget_remaining / max(len(green_signals), 1), 2)
@@ -950,7 +881,6 @@ def run_agent(symbols=None, force=False):
 
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
-    # Add paid column if it doesn't exist
     try:
         c.execute("ALTER TABLE subscribers ADD COLUMN paid INTEGER DEFAULT 0")
         conn.commit()
@@ -969,16 +899,11 @@ def run_agent(symbols=None, force=False):
             if not user_analyses:
                 continue
 
-            # Free tier: top 8 signals only, no thesis
             if not paid:
-                # Take top 8: greens first, then reds, then yellows
                 greens = [a for a in user_analyses if a["flag"] == "GREEN"][:3]
                 reds = [a for a in user_analyses if a["flag"] == "RED"][:3]
                 yellows = [a for a in user_analyses if a["flag"] == "YELLOW"][:2]
                 free_analyses = greens + reds + yellows
-                # Strip thesis for free tier
-                for a in free_analyses:
-                    a = dict(a)
                 user_html = build_free_email(free_analyses, account)
             else:
                 user_html = build_email(user_analyses, account)
@@ -986,7 +911,7 @@ def run_agent(symbols=None, force=False):
             message = Mail(
                 from_email=FROM_EMAIL,
                 to_emails=email,
-                subject=f"JSCAN Daily Brief - {datetime.now().strftime('%b %d')} | {len([a for a in user_analyses if a['flag']=='GREEN'])} GREEN {len([a for a in user_analyses if a['flag']=='RED'])} RED",
+                subject=f"JSCAN Daily Brief - {datetime.utcnow().strftime('%b %d')} | {len([a for a in user_analyses if a['flag']=='GREEN'])} GREEN {len([a for a in user_analyses if a['flag']=='RED'])} RED",
                 html_content=user_html
             )
             sg.send(message)
@@ -994,7 +919,7 @@ def run_agent(symbols=None, force=False):
         except Exception as e:
             print(f"  Email error for {email}: {e}")
 
-    print(f"[{datetime.now()}] Agent done. Analyzed {len(analyses)} stocks.")
+    print(f"[{datetime.utcnow()}] Agent done. Analyzed {len(analyses)} stocks.")
     run_marketing(analyses)
     return analyses
 
@@ -1066,7 +991,7 @@ def generate_marketing_post(analyses, with_link=False):
         prompt = f"""Write a compelling tweet about this AI stock signal. Include the signup URL as plain text.
 
 Signal: {best['symbol']} flagged {flag} at ${best['price']}
-Thesis: {best.get('thesis','')[:120]}
+Thesis: {best.get('verdict','')[:120]}
 Today: {green_count} GREEN, {red_count} RED out of {len(analyses)} stocks analyzed
 {accuracy_line}
 URL: jscan-agent.up.railway.app
@@ -1081,7 +1006,7 @@ Rules:
         prompt = f"""Write a short punchy tweet about this AI stock signal. No links.
 
 Signal: {best['symbol']} flagged {flag} at ${best['price']}
-Thesis: {best.get('thesis','')[:120]}
+Thesis: {best.get('verdict','')[:120]}
 Today: {green_count} GREEN, {red_count} RED out of {len(analyses)} stocks analyzed
 {accuracy_line}
 
@@ -1106,39 +1031,36 @@ def generate_discord_post(analyses):
     greens = [a for a in analyses if a["flag"] == "GREEN"]
     reds = [a for a in analyses if a["flag"] == "RED"]
     yellows = [a for a in analyses if a["flag"] == "YELLOW"]
-    today = datetime.now().strftime("%B %d, %Y")
+    today = datetime.utcnow().strftime("%B %d, %Y")
     msg = f"**JSCAN Daily Signals - {today}**\n\n"
     msg += f"Analyzed **{len(analyses)} stocks** today\n"
     msg += f"**{len(greens)} GREEN** | {len(yellows)} YELLOW | **{len(reds)} RED**\n\n"
     if greens:
         msg += "**TOP BULLISH SIGNALS:**\n"
         for c in greens[:3]:
-            msg += f"🟢 **{c['symbol']}** @ ${c['price']} — {c.get('thesis','')[:80]}...\n"
+            msg += f"🟢 **{c['symbol']}** @ ${c['price']} — {c.get('verdict','')[:80]}...\n"
     if reds:
         msg += "\n**TOP BEARISH SIGNALS:**\n"
         for c in reds[:3]:
-            msg += f"🔴 **{c['symbol']}** @ ${c['price']} — {c.get('thesis','')[:80]}...\n"
+            msg += f"🔴 **{c['symbol']}** @ ${c['price']} — {c.get('verdict','')[:80]}...\n"
     msg += f"\nFull analysis + signup: jscan-agent.up.railway.app"
     return msg
 
 def run_marketing(analyses):
-    print(f"[{datetime.now()}] Running marketing agent...")
+    print(f"[{datetime.utcnow()}] Running marketing agent...")
     if not analyses:
         print("  No analyses to market")
         return
 
-    # Discord - full daily summary (free)
     discord_msg = generate_discord_post(analyses)
     if discord_msg:
         post_to_discord(discord_msg)
 
-    # X - 1 link post
     link_tweet = generate_marketing_post(analyses, with_link=True)
     if link_tweet:
         post_to_x(link_tweet)
         time.sleep(60)
 
-    # X - 4 plain text posts spaced 15 mins apart
     for i in range(4):
         plain_tweet = generate_marketing_post(analyses, with_link=False)
         if plain_tweet:
@@ -1146,9 +1068,9 @@ def run_marketing(analyses):
             if i < 3:
                 time.sleep(900)
 
-    print(f"[{datetime.now()}] Marketing done.")
+    print(f"[{datetime.utcnow()}] Marketing done.")
 
-# ─── FLASK SIGNUP PAGE ────────────────────────────────────
+# ─── FLASK ROUTES ─────────────────────────────────────────
 SIGNUP_HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -1187,25 +1109,20 @@ input[type=email]:focus{border-color:#00ff88}
 <div class="card">
   <div class="logo">J<span>SCAN</span></div>
   <div class="sub">Get a daily AI-powered stock brief delivered to your inbox every morning at 8am.</div>
-
   <label>Your Email</label>
   <input type="email" id="email" placeholder="you@example.com">
-
   <div class="section-label">Pick Your Stocks</div>
   <div class="actions">
     <button class="btn-sm" onclick="selectAll()">Select All</button>
     <button class="btn-sm" onclick="clearAll()">Clear All</button>
   </div>
   <div class="stocks-grid" id="stocks-grid"></div>
-
   <button class="submit" onclick="subscribe()">Subscribe — Free</button>
   <div class="msg" id="msg"></div>
 </div>
-
 <script>
 var STOCKS = """ + json.dumps({k: v for k, v in STOCK_NAMES.items()}) + """;
 var selected = new Set();
-
 function buildGrid(){
   var g = document.getElementById('stocks-grid');
   Object.keys(STOCKS).forEach(function(sym){
@@ -1220,19 +1137,16 @@ function buildGrid(){
     g.appendChild(d);
   });
 }
-
 function selectAll(){
   Object.keys(STOCKS).forEach(function(sym){
     selected.add(sym);
     document.querySelector('[data-sym="'+sym+'"]').classList.add('selected');
   });
 }
-
 function clearAll(){
   selected.clear();
   document.querySelectorAll('.stock-check').forEach(function(d){d.classList.remove('selected');});
 }
-
 function subscribe(){
   var email=document.getElementById('email').value.trim();
   var msg=document.getElementById('msg');
@@ -1247,14 +1161,12 @@ function subscribe(){
     else{showMsg(d.error||'Something went wrong.','error');}
   }).catch(function(){showMsg('Network error.','error');});
 }
-
 function showMsg(text,type){
   var m=document.getElementById('msg');
   m.textContent=text;
   m.className='msg '+type;
   m.style.display='block';
 }
-
 buildGrid();
 </script>
 </body>
@@ -1284,8 +1196,9 @@ def subscribe():
 
 @app.route("/run", methods=["POST"])
 def trigger_run():
-    analyses = run_agent(force=True)
-    return jsonify({"success": True, "analyzed": len(analyses)})
+    import threading
+    threading.Thread(target=lambda: run_agent(force=True), daemon=True).start()
+    return jsonify({"success": True, "message": "Agent started in background"})
 
 @app.route("/status")
 def status():
@@ -1308,7 +1221,6 @@ def status():
 
 @app.route("/dashboard")
 def dashboard():
-    # Get all data
     conn = sqlite3.connect("agent.db")
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM subscribers WHERE active=1")
@@ -1323,17 +1235,14 @@ def dashboard():
     rows = c.fetchall()
     calls = [{"symbol": r[0], "date": r[1], "flag": r[2], "price": r[3],
               "thesis": r[4], "change_pct": r[5], "outcome": r[6], "days": r[7]} for r in rows]
-
-    # Best and worst calls
-    scored = [c for c in calls if c["change_pct"] is not None]
+    scored = [cc for cc in calls if cc["change_pct"] is not None]
     best = sorted(scored, key=lambda x: x["change_pct"] or 0, reverse=True)[:5]
     worst = sorted(scored, key=lambda x: x["change_pct"] or 0)[:5]
-
     conn.close()
+
     account = get_alpaca_account()
     track_record = get_track_record()
     positions = get_alpaca_positions()
-
     portfolio_val = account.get("portfolio_value", 0)
     cash = account.get("cash", 0)
 
@@ -1345,27 +1254,28 @@ def dashboard():
         if o == "incorrect": return '<span style="color:#ff4444;font-weight:600">✗ Wrong</span>'
         return '<span style="color:#555">— Pending</span>'
 
-    # Build track record section
     tr_html = ""
     if track_record:
-        for flag, stats in track_record.items():
+        for flag in ["GREEN", "RED", "YELLOW"]:
+            stats = track_record.get(flag, {})
+            if not isinstance(stats, dict):
+                continue
             fc = flag_color(flag)
-            bar_width = stats["accuracy"]
+            bar_width = stats.get("accuracy", 0)
             tr_html += f"""
             <div style="margin-bottom:16px">
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px">
                     <span style="color:{fc};font-weight:700">{flag}</span>
-                    <span style="color:#fff;font-weight:600">{stats['accuracy']}% accurate</span>
+                    <span style="color:#fff;font-weight:600">{stats.get('accuracy',0)}% accurate</span>
                 </div>
                 <div style="background:#1a1a1a;border-radius:4px;height:8px;overflow:hidden">
-                    <div style="background:{fc};height:100%;width:{bar_width}%;transition:width .5s"></div>
+                    <div style="background:{fc};height:100%;width:{bar_width}%"></div>
                 </div>
-                <div style="color:#444;font-size:.75em;margin-top:4px">{stats['correct']} correct out of {stats['total']} calls (7-day)</div>
+                <div style="color:#444;font-size:.75em;margin-top:4px">{stats.get('correct',0)} correct out of {stats.get('total',0)} calls</div>
             </div>"""
     else:
-        tr_html = '<div style="color:#444;font-size:.88em">No track record yet — needs 7 days of data</div>'
+        tr_html = '<div style="color:#444;font-size:.88em">No track record yet — needs data from scored calls</div>'
 
-    # Build calls table
     calls_html = ""
     for call in calls[:50]:
         fc = flag_color(call["flag"])
@@ -1383,7 +1293,6 @@ def dashboard():
             <td style="padding:10px 16px;color:#555;font-size:.8em;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{call['thesis'] or '—'}</td>
         </tr>"""
 
-    # Positions
     pos_html = ""
     if positions:
         for sym, p in positions.items():
@@ -1425,7 +1334,7 @@ body{{font-family:'Inter',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height
 .section-body{{padding:20px}}
 table{{width:100%;border-collapse:collapse}}
 th{{padding:10px 16px;text-align:left;font-size:.68em;color:#444;text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid #141414}}
-.run-btn{{background:#00ff88;color:#000;border:none;padding:10px 20px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.88em;transition:opacity .2s}}
+.run-btn{{background:#00ff88;color:#000;border:none;padding:10px 20px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.88em}}
 .run-btn:hover{{opacity:.85}}
 .run-btn:disabled{{opacity:.5;cursor:not-allowed}}
 </style>
@@ -1435,43 +1344,22 @@ th{{padding:10px 16px;text-align:left;font-size:.68em;color:#444;text-transform:
   <div class="logo">J<span>SCAN</span> <span style="color:#555;font-size:.65em;font-weight:400;margin-left:8px">Agent Dashboard</span></div>
   <div class="nav">
     <a href="/">Signup</a>
-    <a href="https://jscan-production.up.railway.app" target="_blank">JSCAN ↗</a>
+    <a href="https://jscan.tech" target="_blank">JSCAN ↗</a>
     <button class="run-btn" id="run-btn" onclick="triggerRun()">▶ Run Now</button>
   </div>
 </div>
 <div class="container">
-
-  <!-- Stats -->
   <div class="grid">
-    <div class="stat-card">
-      <div class="stat-label">Portfolio Value</div>
-      <div class="stat-value">${float(portfolio_val):,.0f}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Cash</div>
-      <div class="stat-value" style="color:#e0e0e0">${float(cash):,.0f}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Subscribers</div>
-      <div class="stat-value" style="color:#e0e0e0">{subs}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Total Calls</div>
-      <div class="stat-value" style="color:#e0e0e0">{len(calls)}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Scored Calls</div>
-      <div class="stat-value" style="color:#e0e0e0">{len(scored)}</div>
-    </div>
+    <div class="stat-card"><div class="stat-label">Portfolio Value</div><div class="stat-value">${float(portfolio_val):,.0f}</div></div>
+    <div class="stat-card"><div class="stat-label">Cash</div><div class="stat-value" style="color:#e0e0e0">${float(cash):,.0f}</div></div>
+    <div class="stat-card"><div class="stat-label">Subscribers</div><div class="stat-value" style="color:#e0e0e0">{subs}</div></div>
+    <div class="stat-card"><div class="stat-label">Total Calls</div><div class="stat-value" style="color:#e0e0e0">{len(calls)}</div></div>
+    <div class="stat-card"><div class="stat-label">Scored Calls</div><div class="stat-value" style="color:#e0e0e0">{len(scored)}</div></div>
   </div>
-
-  <!-- Track Record -->
   <div class="section">
-    <div class="section-header">🎯 Track Record (7-day accuracy)</div>
+    <div class="section-header">🎯 Track Record</div>
     <div class="section-body">{tr_html}</div>
   </div>
-
-  <!-- Best/Worst -->
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">
     <div class="section">
       <div class="section-header">🟢 Best Calls</div>
@@ -1486,17 +1374,10 @@ th{{padding:10px 16px;text-align:left;font-size:.68em;color:#444;text-transform:
       </div>
     </div>
   </div>
-
-  <!-- Positions -->
   <div class="section">
     <div class="section-header">📈 Paper Positions</div>
-    <table>
-      <tr><th>Symbol</th><th>Quantity</th><th>Avg Cost</th><th>Current</th><th>P&L</th></tr>
-      {pos_html}
-    </table>
+    <table><tr><th>Symbol</th><th>Quantity</th><th>Avg Cost</th><th>Current</th><th>P&L</th></tr>{pos_html}</table>
   </div>
-
-  <!-- Recent Calls -->
   <div class="section">
     <div class="section-header">📋 Recent Calls (last 50)</div>
     <div style="overflow-x:auto">
@@ -1506,7 +1387,6 @@ th{{padding:10px 16px;text-align:left;font-size:.68em;color:#444;text-transform:
       </table>
     </div>
   </div>
-
 </div>
 <script>
 function triggerRun(){{
@@ -1516,8 +1396,8 @@ function triggerRun(){{
   fetch('/run',{{method:'POST'}})
     .then(function(r){{return r.json();}})
     .then(function(d){{
-      btn.textContent='✓ Done — '+d.analyzed+' stocks';
-      setTimeout(function(){{location.reload();}},2000);
+      btn.textContent='✓ Started';
+      setTimeout(function(){{location.reload();}},3000);
     }})
     .catch(function(){{btn.textContent='Error';btn.disabled=false;}});
 }}
@@ -1530,11 +1410,7 @@ if __name__ == "__main__":
     init_db()
     print("JSCAN Agent starting...")
     print(f"Watching {len(WATCHLIST)} stocks")
-    print("Signup page: http://127.0.0.1:5001")
-    print("Trigger run: POST http://127.0.0.1:5001/run")
-    print("Status: http://127.0.0.1:5001/status")
 
-    # Schedule daily run at 8am
     schedule.every().day.at("15:00").do(run_agent)  # 8am PDT = 15:00 UTC
 
     import threading
