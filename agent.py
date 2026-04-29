@@ -371,6 +371,62 @@ def init_db():
         starting_value REAL DEFAULT 0,
         current_value REAL DEFAULT 0
     )""")
+    # Tier 1: feature buckets stored alongside each call so we can slice
+    # accuracy by feature later. All defensive — older deploys lacked these.
+    for col_def in [
+        "rsi_bucket TEXT",
+        "momentum_bucket TEXT",
+        "regime TEXT",
+        "volume_bucket TEXT",
+        "sentiment_bucket TEXT",
+        "sector TEXT",
+        "dow INTEGER",
+    ]:
+        try:
+            c.execute(f"ALTER TABLE calls ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
+    # Tier 2: versioned prompts per sub-agent role.
+    c.execute("""CREATE TABLE IF NOT EXISTS prompts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_role TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'shadow',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        promoted_at TEXT,
+        retired_at TEXT,
+        UNIQUE(agent_role, version)
+    )""")
+    # Tier 3: each sub-agent's independent flag for every call. Outcome
+    # backfilled by score_past_calls so we can compute per-agent accuracy.
+    c.execute("""CREATE TABLE IF NOT EXISTS sub_agent_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        call_id INTEGER NOT NULL,
+        agent_name TEXT NOT NULL,
+        prompt_version INTEGER,
+        flag TEXT,
+        confidence INTEGER,
+        is_shadow INTEGER DEFAULT 0,
+        outcome TEXT,
+        outcome_change_pct REAL,
+        scored_at TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sub_agent_calls_call ON sub_agent_calls(call_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sub_agent_calls_agent ON sub_agent_calls(agent_name, is_shadow)")
+    # Tier 2: weekly meta-agent's improvement memo. Latest active row is
+    # injected into the synthesizer prompt so the system course-corrects
+    # without requiring redeploys or manual prompt edits.
+    c.execute("""CREATE TABLE IF NOT EXISTS meta_memos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        body TEXT NOT NULL,
+        based_on_calls INTEGER,
+        based_on_window TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        retired_at TEXT
+    )""")
     conn.commit()
     conn.close()
 
@@ -577,14 +633,89 @@ def get_previous_calls():
     conn.close()
     return [{"symbol": r[0], "date": r[1], "flag": r[2], "price": r[3], "thesis": r[4]} for r in rows]
 
-def save_call(symbol, flag, price, thesis):
+def _bucket_rsi(rsi):
+    if rsi is None: return None
+    if rsi <= 30: return "oversold"
+    if rsi <= 45: return "weak"
+    if rsi <= 55: return "neutral"
+    if rsi <= 70: return "strong"
+    return "overbought"
+
+def _bucket_momentum(trend_5d):
+    if trend_5d is None: return None
+    if trend_5d <= -3: return "strong_down"
+    if trend_5d <= -0.5: return "down"
+    if trend_5d < 0.5: return "flat"
+    if trend_5d < 3: return "up"
+    return "strong_up"
+
+def _bucket_volume(volume, avg_volume):
+    if not volume or not avg_volume: return None
+    ratio = volume / avg_volume
+    if ratio >= 2.0: return "very_high"
+    if ratio >= 1.3: return "high"
+    if ratio >= 0.7: return "normal"
+    return "low"
+
+def _bucket_sentiment(news_score):
+    """News agent score is in [-10, +10]."""
+    if news_score is None: return None
+    if news_score <= -4: return "bearish"
+    if news_score <= -1: return "soft_bearish"
+    if news_score < 1: return "neutral"
+    if news_score < 4: return "soft_bullish"
+    return "bullish"
+
+def _sector_for(symbol):
+    for sec, syms in SECTOR_MAP.items():
+        if symbol in syms:
+            return sec
+    return "OTHER"
+
+def _market_regime_label(regime_text):
+    """Pull BULLISH/NEUTRAL/BEARISH from the get_market_regime() output."""
+    if not regime_text:
+        return None
+    t = regime_text.upper()
+    for label in ("BULLISH", "BEARISH", "NEUTRAL"):
+        if label in t:
+            return label
+    return None
+
+def save_sub_agent_calls(call_id, sub_parsed, prompt_versions=None):
+    """Persist each sub-agent's independent flag for this call. prompt_versions is
+    optional {agent_name: int} for tier-2 versioned prompts."""
+    if not call_id or not sub_parsed:
+        return
+    pv = prompt_versions or {}
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for agent_name, parsed in sub_parsed.items():
+        c.execute("""INSERT INTO sub_agent_calls
+            (call_id, agent_name, prompt_version, flag, confidence, is_shadow)
+            VALUES (?, ?, ?, ?, ?, 0)""",
+            (call_id, agent_name, pv.get(agent_name), parsed.get("flag"), parsed.get("confidence")))
+    conn.commit()
+    conn.close()
+
+def save_call(symbol, flag, price, thesis, features=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    c.execute("INSERT INTO calls (symbol, date, flag, price, thesis) VALUES (?, ?, ?, ?, ?)",
-              (symbol, today, flag, price, thesis))
+    f = features or {}
+    c.execute("""INSERT INTO calls
+        (symbol, date, flag, price, thesis, rsi_bucket, momentum_bucket, regime,
+         volume_bucket, sentiment_bucket, sector, dow)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, today, flag, price, thesis,
+         f.get("rsi_bucket"), f.get("momentum_bucket"), f.get("regime"),
+         f.get("volume_bucket"), f.get("sentiment_bucket"),
+         f.get("sector") or _sector_for(symbol),
+         f.get("dow") if f.get("dow") is not None else datetime.utcnow().weekday()))
+    call_id = c.lastrowid
     conn.commit()
     conn.close()
+    return call_id
 
 # ─── SELF-LEARNING ────────────────────────────────────────
 def get_close_on_or_after(symbol, date_str):
@@ -656,7 +787,38 @@ def score_past_calls():
 
     conn.commit()
     conn.close()
-    print(f"  Scored {scored} past calls (skipped: future={skipped_future}, parse={skipped_parse}, no_price={skipped_noprice})")
+    sub_scored = score_sub_agent_calls()
+    print(f"  Scored {scored} past calls (skipped: future={skipped_future}, parse={skipped_parse}, no_price={skipped_noprice}); sub-agent rows scored: {sub_scored}")
+    return scored
+
+def score_sub_agent_calls():
+    """For every sub_agent_calls row whose parent call has a 1d result, mark
+    correct/incorrect/neutral using the same thresholds as the main call."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT sac.id, sac.flag, cr.price_change_pct
+        FROM sub_agent_calls sac
+        JOIN call_results cr ON cr.call_id = sac.call_id AND cr.days_later = 1
+        WHERE sac.outcome IS NULL
+    """)
+    rows = c.fetchall()
+    scored = 0
+    now = datetime.utcnow().isoformat()
+    for sac_id, flag, change_pct in rows:
+        if change_pct is None:
+            continue
+        if flag == "GREEN":
+            outcome = "correct" if change_pct > 0.5 else "incorrect" if change_pct < -0.5 else "neutral"
+        elif flag == "RED":
+            outcome = "correct" if change_pct < -0.5 else "incorrect" if change_pct > 0.5 else "neutral"
+        else:
+            outcome = "neutral"
+        c.execute("UPDATE sub_agent_calls SET outcome=?, outcome_change_pct=?, scored_at=? WHERE id=?",
+                  (outcome, change_pct, now, sac_id))
+        scored += 1
+    conn.commit()
+    conn.close()
     return scored
 
 def get_track_record():
@@ -698,6 +860,190 @@ def get_track_record():
     if sector_stats:
         stats["sectors"] = sector_stats
     return stats
+
+# Tier 1: surface specific feature slices that are way better/worse than average,
+# so the portfolio_manager prompt can warn about (or lean into) them.
+SLICE_FEATURES = [
+    ("flag", "rsi_bucket"),
+    ("flag", "momentum_bucket"),
+    ("flag", "regime"),
+    ("flag", "volume_bucket"),
+    ("flag", "sentiment_bucket"),
+    ("flag", "sector"),
+]
+SLICE_MIN_N = 8           # need at least this many calls in a slice to trust it
+SLICE_DELTA = 12.0        # accuracy must deviate from baseline by this much (pp)
+
+def get_slice_insights(max_per_side=3, lookback_days=60):
+    """Return ([best_slices], [worst_slices]) — strings ready to drop into a prompt.
+    A slice = (flag, feature_value); only emitted if it has SLICE_MIN_N calls
+    and is at least SLICE_DELTA percentage points off the overall baseline."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Baseline: overall correct-rate at 1d horizon.
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    c.execute("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN cr.outcome='correct' THEN 1 ELSE 0 END)
+        FROM call_results cr JOIN calls ca ON cr.call_id = ca.id
+        WHERE cr.days_later = 1 AND ca.date >= ?
+    """, (cutoff,))
+    total, correct = c.fetchone()
+    if not total or total < 20:
+        conn.close()
+        return [], []
+    baseline = correct / total * 100
+
+    rows_out = []
+    for flag_col, feat_col in SLICE_FEATURES:
+        c.execute(f"""
+            SELECT ca.{flag_col}, ca.{feat_col},
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN cr.outcome='correct' THEN 1 ELSE 0 END) AS correct
+            FROM call_results cr JOIN calls ca ON cr.call_id = ca.id
+            WHERE cr.days_later = 1
+              AND ca.date >= ?
+              AND ca.{feat_col} IS NOT NULL
+              AND ca.{flag_col} IS NOT NULL
+            GROUP BY ca.{flag_col}, ca.{feat_col}
+            HAVING n >= ?
+        """, (cutoff, SLICE_MIN_N))
+        for flag_val, feat_val, n, correct_n in c.fetchall():
+            acc = correct_n / n * 100
+            delta = acc - baseline
+            if abs(delta) >= SLICE_DELTA:
+                rows_out.append({
+                    "flag": flag_val, "feature": feat_col, "value": feat_val,
+                    "n": n, "accuracy": round(acc, 1), "delta": round(delta, 1),
+                })
+    conn.close()
+
+    rows_out.sort(key=lambda r: r["delta"])
+    worst = rows_out[:max_per_side]
+    best = list(reversed(rows_out[-max_per_side:])) if rows_out else []
+    return best, worst
+
+def format_slice_insights():
+    """String form to drop into the portfolio_manager prompt. Empty if not enough data."""
+    best, worst = get_slice_insights()
+    if not best and not worst:
+        return ""
+    lines = ["LEARNED PATTERNS (from your own scored history):"]
+    for r in best:
+        lines.append(
+            f"  STRONG SIGNAL — {r['flag']} calls when {r['feature'].replace('_bucket','').replace('_',' ')}={r['value']}: "
+            f"{r['accuracy']}% accurate over {r['n']} calls (+{r['delta']}pp vs baseline). Lean into this."
+        )
+    for r in worst:
+        lines.append(
+            f"  WARN — {r['flag']} calls when {r['feature'].replace('_bucket','').replace('_',' ')}={r['value']}: "
+            f"only {r['accuracy']}% over {r['n']} calls ({r['delta']}pp). Avoid or downgrade conviction."
+        )
+    return "\n" + "\n".join(lines)
+
+def get_active_meta_memo():
+    """Latest active improvement memo from the weekly meta-agent."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT body, created_at FROM meta_memos WHERE is_active=1 ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return {"body": row[0], "created_at": row[1]} if row else None
+
+def generate_meta_memo(window_days=14, max_calls=200):
+    """Weekly meta-agent: review the last window's scored calls + their
+    sub-agent breakdowns, identify systematic mistakes, and produce a short
+    actionable memo to inject into next week's synthesizer prompt.
+    Only generates a memo if there are at least 30 scored calls in the window.
+    Retires older memos so only the latest is active."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = (datetime.utcnow() - timedelta(days=window_days)).strftime("%Y-%m-%d")
+    c.execute("""
+        SELECT ca.id, ca.symbol, ca.date, ca.flag, ca.rsi_bucket, ca.momentum_bucket,
+               ca.regime, ca.sentiment_bucket, ca.sector, cr.outcome, cr.price_change_pct
+        FROM calls ca
+        JOIN call_results cr ON cr.call_id = ca.id AND cr.days_later = 1
+        WHERE ca.date >= ?
+        ORDER BY ca.date DESC
+        LIMIT ?
+    """, (cutoff, max_calls))
+    rows = c.fetchall()
+
+    if len(rows) < 30:
+        conn.close()
+        print(f"  Meta-agent: only {len(rows)} scored calls in last {window_days}d (need 30+); skipping")
+        return None
+
+    sub_lookup = {}
+    if rows:
+        ids = [r[0] for r in rows]
+        c.execute(f"""SELECT call_id, agent_name, flag, outcome FROM sub_agent_calls
+                     WHERE call_id IN ({",".join("?" * len(ids))}) AND is_shadow=0""", ids)
+        for cid, agent_name, flag, outcome in c.fetchall():
+            sub_lookup.setdefault(cid, []).append((agent_name, flag, outcome))
+    conn.close()
+
+    correct = sum(1 for r in rows if r[9] == "correct")
+    incorrect = sum(1 for r in rows if r[9] == "incorrect")
+    accuracy = round(correct / len(rows) * 100, 1) if rows else 0
+
+    lines = [f"OVERALL: {accuracy}% accurate over {len(rows)} calls in last {window_days} days ({correct} correct, {incorrect} incorrect)."]
+    lines.append("\nSAMPLE CALLS (newest first):")
+    for r in rows[:60]:
+        cid, sym, dt, flag, rsi_b, mom_b, reg, sent_b, sec, outcome, chg = r
+        sub_summary = ", ".join(f"{a}={f}({o or '?'})" for a, f, o in sub_lookup.get(cid, []))
+        lines.append(
+            f"  {dt} {sym} → {flag} | rsi={rsi_b} mom={mom_b} regime={reg} sent={sent_b} sec={sec}"
+            f" | actual {chg:+.2f}% → {outcome.upper()} | sub-agents: {sub_summary or 'none'}"
+        )
+    history_blob = "\n".join(lines)
+
+    system = (
+        "You are a senior trading-systems analyst reviewing an AI stock-call agent's recent performance. "
+        "Your job: identify SPECIFIC, recurring patterns of failure or success and produce a concise improvement memo. "
+        "The memo will be injected into the agent's prompt next week, so it must be actionable, concrete, and short."
+    )
+    user_msg = f"""Below are the agent's recent calls and outcomes. Review them and produce an IMPROVEMENT MEMO.
+
+REQUIREMENTS:
+- 5-7 bullet points, each one specific and actionable.
+- Reference concrete buckets (RSI, momentum, regime, sector, sub-agent) when calling out patterns.
+- Distinguish what's WORKING (lean in) from what's BREAKING (avoid / downgrade conviction).
+- If a sub-agent is consistently wrong, say so by name and recommend down-weighting it.
+- Do NOT propose vague advice like "be more careful". Every bullet must change a decision.
+
+{history_blob}
+
+Output format — start each line with "- " and nothing else. No preamble, no closing line."""
+
+    try:
+        msg = claude_call(
+            model="claude-sonnet-4-5",
+            max_tokens=600,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}]
+        )
+        memo_body = msg.content[0].text.strip()
+    except Exception as e:
+        print(f"  Meta-agent error: {e}")
+        return None
+
+    if not memo_body:
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    c.execute("UPDATE meta_memos SET is_active=0, retired_at=? WHERE is_active=1", (now,))
+    c.execute("""INSERT INTO meta_memos (body, based_on_calls, based_on_window, is_active)
+        VALUES (?, ?, ?, 1)""", (memo_body, len(rows), f"{window_days}d"))
+    memo_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    print(f"  Meta-agent: generated memo #{memo_id} from {len(rows)} calls")
+    return {"id": memo_id, "body": memo_body, "based_on_calls": len(rows)}
 
 def get_stock_history(symbol):
     try:
@@ -836,6 +1182,8 @@ Respond in this EXACT format:
 SENTIMENT_SCORE: [number from -10 to +10, where -10 is extremely bearish, 0 is neutral, +10 is extremely bullish]
 KEY_CATALYST: [single most important news item, or "None" if no significant news]
 RISK_FLAG: [any major risks mentioned in news, or "None"]
+FLAG: [GREEN if news clearly bullish enough to drive price up next day / RED if clearly bearish / YELLOW if mixed or no catalyst]
+CONFIDENCE: [1-10, how confident you are in this flag]
 SUMMARY: [1 sentence summary of news sentiment]"""
 
     msg = claude_call(
@@ -907,6 +1255,8 @@ RANGE_POSITION: [TOP_THIRD / MIDDLE / BOTTOM_THIRD]
 TREND: [BULLISH / NEUTRAL / BEARISH]
 RSI_SIGNAL: [OVERBOUGHT / NEUTRAL / OVERSOLD]
 STRENGTH_SCORE: [number from -10 to +10]
+FLAG: [GREEN if technicals favor upside next day / RED if downside / YELLOW if mixed or extended in either direction]
+CONFIDENCE: [1-10, how confident you are in this flag]
 SUMMARY: [1 sentence technical assessment that incorporates the MA and RSI context]"""
 
     msg = claude_call(
@@ -933,6 +1283,8 @@ Respond in this EXACT format:
 MARKET_CONDITIONS: [RISK_ON / NEUTRAL / RISK_OFF]
 RELATIVE_STRENGTH: [OUTPERFORMING / IN_LINE / UNDERPERFORMING]
 MACRO_SCORE: [number from -10 to +10]
+FLAG: [GREEN if macro/sentiment favors this stock next day / RED if it points lower / YELLOW if neutral]
+CONFIDENCE: [1-10, how confident you are in this flag]
 SUMMARY: [1 sentence macro/sentiment assessment]"""
 
     msg = claude_call(
@@ -987,6 +1339,41 @@ def portfolio_manager(symbol, price_data, news_report, technical_report, sentime
     stock_history = get_stock_history(symbol)
     market_regime = track_record.get("regime", "")
 
+    # Tier 3: parse each sub-agent's flag, fetch their recent accuracy, and run
+    # the explicit weighted ensemble vote. Pass everything to the synthesizer.
+    sub_parsed = {
+        "news": parse_sub_agent(news_report),
+        "technical": parse_sub_agent(technical_report),
+        "sentiment": parse_sub_agent(sentiment_report),
+    }
+    agent_acc = get_sub_agent_accuracy()
+    if agent_acc:
+        acc_lines = []
+        for name_key in ("news", "technical", "sentiment"):
+            a = agent_acc.get(name_key)
+            if a and a.get("n", 0) >= 5:
+                acc_lines.append(f"  {name_key.upper()} agent: {a['accuracy']}% accurate over {a['n']} recent calls")
+        if acc_lines:
+            track_text += "\nSUB-AGENT TRACK RECORDS (use these to weight the analyst votes):\n" + "\n".join(acc_lines)
+
+    suggested, score, breakdown = ensemble_vote(sub_parsed, agent_acc)
+    ensemble_text = (
+        f"\nWEIGHTED ENSEMBLE VOTE (advisory):\n"
+        f"  Suggests: {suggested} (score {score:+.2f}, where +0.25 = GREEN threshold, -0.25 = RED)\n"
+        f"  Breakdown: {breakdown}\n"
+        f"  You may override this if the analyst reasoning warrants it, but state why."
+    )
+
+    # Tier 1: feed back the best/worst feature slices from your own scored history.
+    slice_text = format_slice_insights()
+
+    # Tier 2: latest weekly improvement memo from the meta-agent.
+    memo = get_active_meta_memo()
+    memo_text = (
+        f"\nIMPROVEMENT MEMO (from this week's meta-agent review — apply these adjustments):\n{memo['body']}"
+        if memo else ""
+    )
+
     user_msg = f"""Stock: {name} ({symbol})
 
 ANALYST REPORTS:
@@ -1004,6 +1391,9 @@ Price: ${price_data.get('price')} | Change: {price_data.get('change_pct')}%
 {prev_call_text}
 {position_text}
 {track_text}
+{ensemble_text}
+{slice_text}
+{memo_text}
 {stock_history}
 {market_regime}
 
@@ -1031,19 +1421,101 @@ def analyze_stock(symbol, price_data, news, previous_calls, positions, track_rec
     try:
         news_report = news_agent(symbol, name, news)
     except Exception:
-        news_report = "SENTIMENT_SCORE: 0\nKEY_CATALYST: None\nRISK_FLAG: None\nSUMMARY: News analysis unavailable."
+        news_report = "SENTIMENT_SCORE: 0\nKEY_CATALYST: None\nRISK_FLAG: None\nFLAG: YELLOW\nCONFIDENCE: 1\nSUMMARY: News analysis unavailable."
 
     try:
         tech_report = technical_agent(symbol, name, price_data, indicators)
     except Exception:
-        tech_report = "MOMENTUM: NEUTRAL\nVOLUME_SIGNAL: NORMAL\nRANGE_POSITION: MIDDLE\nTREND: NEUTRAL\nRSI_SIGNAL: NEUTRAL\nSTRENGTH_SCORE: 0\nSUMMARY: Technical analysis unavailable."
+        tech_report = "MOMENTUM: NEUTRAL\nVOLUME_SIGNAL: NORMAL\nRANGE_POSITION: MIDDLE\nTREND: NEUTRAL\nRSI_SIGNAL: NEUTRAL\nSTRENGTH_SCORE: 0\nFLAG: YELLOW\nCONFIDENCE: 1\nSUMMARY: Technical analysis unavailable."
 
     try:
         sent_report = sentiment_agent(symbol, name, price_data, all_prices)
     except Exception:
-        sent_report = "MARKET_CONDITIONS: NEUTRAL\nRELATIVE_STRENGTH: IN_LINE\nMACRO_SCORE: 0\nSUMMARY: Sentiment analysis unavailable."
+        sent_report = "MARKET_CONDITIONS: NEUTRAL\nRELATIVE_STRENGTH: IN_LINE\nMACRO_SCORE: 0\nFLAG: YELLOW\nCONFIDENCE: 1\nSUMMARY: Sentiment analysis unavailable."
 
-    return portfolio_manager(symbol, price_data, news_report, tech_report, sent_report, previous_calls, positions, track_record or {})
+    pm_text = portfolio_manager(symbol, price_data, news_report, tech_report, sent_report, previous_calls, positions, track_record or {})
+    # Return rich dict so the caller can persist sub-agent flags (Tier 3) and
+    # feature buckets (Tier 1). Keep .raw for backwards-compatible parsing.
+    return {
+        "raw": pm_text,
+        "reports": {
+            "news": news_report,
+            "technical": tech_report,
+            "sentiment": sent_report,
+        },
+    }
+
+def parse_sub_agent(text):
+    """Pull FLAG, CONFIDENCE, and the numeric score (SENTIMENT_SCORE / STRENGTH_SCORE / MACRO_SCORE)
+    out of a sub-agent report. Score key is whichever appears in the text."""
+    out = {"flag": "YELLOW", "confidence": 5, "score": None}
+    if not text:
+        return out
+    for raw_line in text.strip().split("\n"):
+        line = raw_line.strip()
+        if line.startswith("FLAG:"):
+            v = line.split(":", 1)[1].strip().upper()
+            if "GREEN" in v: out["flag"] = "GREEN"
+            elif "RED" in v: out["flag"] = "RED"
+            else: out["flag"] = "YELLOW"
+        elif line.startswith("CONFIDENCE:"):
+            try: out["confidence"] = max(1, min(10, int(re.search(r"\d+", line).group())))
+            except (AttributeError, ValueError): pass
+        elif any(line.startswith(k) for k in ("SENTIMENT_SCORE:", "STRENGTH_SCORE:", "MACRO_SCORE:")):
+            try:
+                out["score"] = float(re.search(r"-?\d+(?:\.\d+)?", line.split(":", 1)[1]).group())
+            except (AttributeError, ValueError):
+                pass
+    return out
+
+def get_sub_agent_accuracy(lookback_days=30, min_n=10, prior_acc=0.5, prior_weight=10):
+    """Return {agent_name: {"accuracy": pct, "n": int}}. Smoothed with a 50%/10-call
+    prior so cold-start agents don't get crushed."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    c.execute("""
+        SELECT sac.agent_name,
+               COUNT(*) AS n,
+               SUM(CASE WHEN sac.outcome='correct' THEN 1 ELSE 0 END) AS correct
+        FROM sub_agent_calls sac
+        JOIN calls c ON sac.call_id = c.id
+        WHERE sac.is_shadow = 0
+          AND sac.outcome IS NOT NULL
+          AND c.date >= ?
+        GROUP BY sac.agent_name
+    """, (cutoff,))
+    out = {}
+    for agent, n, correct in c.fetchall():
+        smoothed = (correct + prior_acc * prior_weight) / (n + prior_weight)
+        out[agent] = {"accuracy": round(smoothed * 100, 1), "n": n}
+    conn.close()
+    return out
+
+def ensemble_vote(sub_parsed, agent_acc):
+    """Hard-coded weighted ensemble for Tier 3: maps GREEN=+1, YELLOW=0, RED=-1,
+    weights each vote by (smoothed_accuracy - 0.33 baseline) clamped to [0.05, 1].
+    Returns (suggested_flag, score, breakdown_str). Suggested_flag is advisory —
+    the synthesizer (Sonnet) still makes the call."""
+    val = {"GREEN": 1.0, "YELLOW": 0.0, "RED": -1.0}
+    total_w = 0.0
+    score = 0.0
+    parts = []
+    for agent_name, parsed in sub_parsed.items():
+        flag = parsed.get("flag", "YELLOW")
+        conf = (parsed.get("confidence") or 5) / 10.0
+        acc_pct = (agent_acc.get(agent_name) or {}).get("accuracy", 50.0) / 100.0
+        # Skill weight: how much better than chance. Floor so cold-start agents still vote.
+        w_skill = max(0.05, min(1.0, acc_pct - 0.33))
+        w = w_skill * conf
+        score += val[flag] * w
+        total_w += w
+        parts.append(f"{agent_name}={flag}(conf {parsed.get('confidence',5)}, acc {round(acc_pct*100,0)}%)")
+    norm = score / total_w if total_w else 0
+    if norm >= 0.25: suggested = "GREEN"
+    elif norm <= -0.25: suggested = "RED"
+    else: suggested = "YELLOW"
+    return suggested, round(norm, 2), " | ".join(parts)
 
 def parse_analysis(text):
     lines = text.strip().split("\n")
@@ -1267,21 +1739,42 @@ def analyze_one_stock(sym, price_data_all, previous_calls, positions, track_reco
     indicators = compute_indicators(closes)
 
     try:
-        raw = analyze_stock(sym, pd, news, previous_calls, positions, track_record, price_data_all, indicators)
+        analysis = analyze_stock(sym, pd, news, previous_calls, positions, track_record, price_data_all, indicators)
     except Exception as e:
         print(f"  Error analyzing {sym}: {e}")
         return None
 
-    parsed = parse_analysis(raw)
+    parsed = parse_analysis(analysis["raw"])
     parsed["symbol"] = sym
     parsed["name"] = name
     parsed["price"] = pd["price"]
     parsed["change_pct"] = pd["change_pct"]
 
+    # Parse each sub-agent's flag + score so we can persist them and bucket features.
+    reports = analysis.get("reports", {})
+    sub_parsed = {agent_name: parse_sub_agent(reports.get(agent_name, "")) for agent_name in ("news", "technical", "sentiment")}
+
+    features = {
+        "rsi_bucket": _bucket_rsi(indicators.get("rsi")),
+        "momentum_bucket": _bucket_momentum(indicators.get("trend_5d")),
+        "regime": _market_regime_label(track_record.get("regime", "") if track_record else ""),
+        "volume_bucket": None,  # avg volume not currently tracked; left for future expansion
+        "sentiment_bucket": _bucket_sentiment(sub_parsed["news"].get("score")),
+        "sector": _sector_for(sym),
+        "dow": datetime.utcnow().weekday(),
+    }
+
+    call_id = None
     try:
-        save_call(sym, parsed["flag"], pd["price"], parsed["verdict"])
+        call_id = save_call(sym, parsed["flag"], pd["price"], parsed["verdict"], features=features)
     except Exception as e:
         print(f"  save_call error for {sym}: {e}")
+
+    if call_id:
+        try:
+            save_sub_agent_calls(call_id, sub_parsed)
+        except Exception as e:
+            print(f"  sub_agent_calls error for {sym}: {e}")
 
     action = parsed["action"].upper()
     if "BUY" in action and parsed["flag"] == "GREEN":
@@ -2089,6 +2582,26 @@ def trigger_run():
     threading.Thread(target=lambda: run_agent(force=True), daemon=True).start()
     return jsonify({"success": True, "message": "Agent started in background"})
 
+@app.route("/meta-evolve", methods=["POST"])
+@require_auth
+def trigger_meta_evolve():
+    """Manually trigger the weekly meta-agent. Normally runs Sundays via cron."""
+    def go():
+        try:
+            generate_meta_memo()
+        except Exception as e:
+            print(f"  Meta-evolve error: {e}")
+    threading.Thread(target=go, daemon=True).start()
+    return jsonify({"success": True, "message": "Meta-agent started in background"})
+
+@app.route("/api/meta-memo", methods=["GET"])
+def api_meta_memo():
+    """Public read of the latest meta-agent memo so jscan.tech (or you) can audit it."""
+    memo = get_active_meta_memo()
+    if not memo:
+        return jsonify({"memo": None})
+    return jsonify({"memo": memo})
+
 @app.route("/status")
 def status():
     conn = sqlite3.connect(DB_PATH)
@@ -2307,6 +2820,8 @@ if __name__ == "__main__":
         getattr(schedule.every(), day).at("14:00").do(run_agent)
     # Friday weekly recap at 21:30 UTC (~4:30pm ET — after market close)
     schedule.every().friday.at("21:30").do(run_weekly_report)
+    # Sunday meta-agent: review the week's calls and write next week's improvement memo.
+    schedule.every().sunday.at("23:00").do(generate_meta_memo)
 
     def run_schedule():
         while True:
