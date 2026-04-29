@@ -1833,6 +1833,34 @@ def unsubscribe():
 <p style="color:#555;font-size:13px">Changed your mind? Resubscribe at <a href="{PUBLIC_BASE_URL}" style="color:#00ff88">{PUBLIC_BASE_URL}</a></p>
 </body></html>"""
 
+@app.route("/api/accuracy", methods=["GET", "OPTIONS"])
+def api_accuracy():
+    """Public endpoint exposing the agent's track record for jscan.tech's
+    AI Accuracy tab. Returns last 100 scored calls + summary stats."""
+    if request.method == "OPTIONS":
+        return "", 204
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+            FROM calls ca
+            JOIN call_results cr ON ca.id = cr.call_id
+            WHERE cr.days_later = 1
+            ORDER BY ca.date DESC, ca.id DESC
+            LIMIT 100
+        """)
+        rows = c.fetchall()
+        conn.close()
+        calls = [{
+            "symbol": r[0], "flag": r[1], "price": r[2],
+            "date": r[3], "outcome": r[4], "change_pct": r[5],
+        } for r in rows]
+        correct = sum(1 for cc in calls if cc["outcome"] == "correct")
+        return jsonify({"calls": calls, "correct": correct, "total": len(calls)})
+    except Exception as e:
+        return jsonify({"calls": [], "correct": 0, "total": 0, "error": str(e)}), 500
+
 @app.route("/api/portfolio", methods=["GET", "OPTIONS"])
 def api_portfolio():
     """Public endpoint, gated by premium key. Returns the agent's paper portfolio
