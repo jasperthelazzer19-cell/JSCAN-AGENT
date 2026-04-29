@@ -3,6 +3,7 @@ import re
 import time
 import json
 import hmac
+import uuid
 import hashlib
 import sqlite3
 import threading
@@ -131,6 +132,46 @@ def unsubscribe_link(email):
     token = unsubscribe_token(email)
     return f"{PUBLIC_BASE_URL}/unsubscribe?email={email}&token={token}"
 
+# ─── PREMIUM KEY ──────────────────────────────────────────
+JSCAN_BASE_URL = os.environ.get("JSCAN_BASE_URL", "https://jscan-production.up.railway.app")
+
+def ensure_premium_key(email):
+    """Generate and store a premium key for a paid subscriber if they don't have one.
+    Returns the key, or None if subscriber doesn't exist or isn't paid."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT premium_key, paid FROM subscribers WHERE email=? AND active=1", (email,))
+    row = c.fetchone()
+    if not row or not row[1]:  # not subscribed or not paid
+        conn.close()
+        return None
+    if row[0]:
+        conn.close()
+        return row[0]
+    new_key = uuid.uuid4().hex
+    c.execute("UPDATE subscribers SET premium_key=? WHERE email=?", (new_key, email))
+    conn.commit()
+    conn.close()
+    return new_key
+
+def lookup_email_by_premium_key(key):
+    """Return (email, paid, active) for a given premium key, or None if not found."""
+    if not key or len(key) < 16:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT email, paid, active FROM subscribers WHERE premium_key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row  # (email, paid, active) or None
+
+def portfolio_link(email):
+    """Magic link to jscan.tech AI Portfolio with the user's premium key embedded."""
+    key = ensure_premium_key(email)
+    if not key:
+        return ""
+    return f"{JSCAN_BASE_URL}/?key={key}#portfolio"
+
 # ─── EMAIL VALIDATION + RATE LIMITING ─────────────────────
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
@@ -230,13 +271,15 @@ def init_db():
         stocks TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         active INTEGER DEFAULT 1,
-        paid INTEGER DEFAULT 0
+        paid INTEGER DEFAULT 0,
+        premium_key TEXT
     )""")
-    # Defensive migration for already-existing subscribers tables
-    try:
-        c.execute("ALTER TABLE subscribers ADD COLUMN paid INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+    # Defensive migrations for older schemas
+    for col_def in ["paid INTEGER DEFAULT 0", "premium_key TEXT"]:
+        try:
+            c.execute(f"ALTER TABLE subscribers ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
     c.execute("""CREATE TABLE IF NOT EXISTS calls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
@@ -390,6 +433,19 @@ def get_alpaca_account():
         return r.json()
     except:
         return {}
+
+def get_alpaca_orders(limit=30, status="all"):
+    """Recent orders (filled, cancelled, etc.) for the paper account."""
+    try:
+        r = requests.get(
+            f"{ALPACA_BASE_URL}/v2/orders",
+            params={"status": status, "limit": limit, "direction": "desc"},
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            timeout=8
+        )
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
 
 WEEKLY_BUDGET = int(os.environ.get("WEEKLY_BUDGET", "10000"))
 
@@ -955,6 +1011,15 @@ def build_email(analyses, account, email=None):
     cash = account.get("cash", "N/A")
     unsub = unsubscribe_link(email)
     unsub_html = f'<div style="text-align:center;color:#444;font-size:11px;margin-top:8px"><a href="{unsub}" style="color:#666;text-decoration:underline">Unsubscribe</a></div>' if unsub else ""
+    portfolio_url = portfolio_link(email)
+    portfolio_cta = (
+        f'<div style="text-align:center;margin:24px 0 16px"><a href="{portfolio_url}" '
+        f'style="display:inline-block;background:#00ff88;color:#000;font-weight:700;'
+        f'padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">'
+        f'View AI Portfolio →</a><div style="color:#555;font-size:11px;margin-top:6px">'
+        f'See exactly what the agent is holding right now</div></div>'
+        if portfolio_url else ""
+    )
 
     green = [a for a in analyses if a["flag"] == "GREEN"]
     yellow = [a for a in analyses if a["flag"] == "YELLOW"]
@@ -1028,6 +1093,7 @@ def build_email(analyses, account, email=None):
         {rows}
       </table>
     </div>
+    {portfolio_cta}
     <div style="color:#333;font-size:12px;text-align:center;padding-top:16px;border-top:1px solid #1a1a1a">
       JSCAN AI Agent · Paper trading only · Not financial advice · Powered by Claude AI
     </div>
@@ -1285,6 +1351,8 @@ def run_agent(symbols=None, force=False):
                 yellows = [a for a in user_analyses if a["flag"] == "YELLOW"][:2]
                 user_html = build_free_email(greens + reds + yellows, account, email=email)
             else:
+                # Auto-issue premium key on first paid email so they get the AI Portfolio link
+                ensure_premium_key(email)
                 user_html = build_email(user_analyses, account, email=email)
 
             message = Mail(
@@ -1588,6 +1656,104 @@ def unsubscribe():
 <p>{email} will no longer receive JSCAN briefs.</p>
 <p style="color:#555;font-size:13px">Changed your mind? Resubscribe at <a href="{PUBLIC_BASE_URL}" style="color:#00ff88">{PUBLIC_BASE_URL}</a></p>
 </body></html>"""
+
+@app.route("/api/portfolio", methods=["GET", "OPTIONS"])
+def api_portfolio():
+    """Public endpoint, gated by premium key. Returns the agent's paper portfolio
+    state for jscan.tech to render on the AI Portfolio tab."""
+    if request.method == "OPTIONS":
+        return "", 204
+    key = (request.args.get("key") or "").strip()
+    row = lookup_email_by_premium_key(key)
+    if not row:
+        return jsonify({"error": "invalid key"}), 401
+    email, paid, active = row
+    if not paid or not active:
+        return jsonify({"error": "subscription inactive"}), 403
+
+    account = get_alpaca_account()
+    positions_raw = get_alpaca_positions()
+    orders_raw = get_alpaca_orders(limit=30, status="closed")
+    track_record = get_track_record()
+
+    positions = []
+    for sym, p in positions_raw.items():
+        try:
+            avg = float(p.get("avg_entry_price", 0) or 0)
+            cur = float(p.get("current_price", 0) or 0)
+            qty = float(p.get("qty", 0) or 0)
+            pl = float(p.get("unrealized_pl", 0) or 0)
+            pl_pct = float(p.get("unrealized_plpc", 0) or 0) * 100
+        except (TypeError, ValueError):
+            continue
+        positions.append({
+            "symbol": sym,
+            "name": STOCK_NAMES.get(sym, sym),
+            "qty": qty,
+            "avg_cost": round(avg, 2),
+            "current": round(cur, 2),
+            "market_value": round(cur * qty, 2),
+            "pl": round(pl, 2),
+            "pl_pct": round(pl_pct, 2),
+        })
+    positions.sort(key=lambda x: x["market_value"], reverse=True)
+
+    trades = []
+    for o in orders_raw:
+        if o.get("status") not in ("filled", "partially_filled"):
+            continue
+        try:
+            qty = float(o.get("filled_qty") or o.get("qty") or 0)
+            price = float(o.get("filled_avg_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        trades.append({
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "qty": qty,
+            "price": round(price, 2),
+            "cost": round(qty * price, 2),
+            "filled_at": o.get("filled_at") or o.get("submitted_at"),
+        })
+
+    # Strip stats that aren't meaningful externally; expose track record summary
+    flag_stats = {}
+    for flag in ["GREEN", "RED", "YELLOW"]:
+        s = track_record.get(flag)
+        if isinstance(s, dict) and s.get("total"):
+            flag_stats[flag_to_action(flag)] = {
+                "accuracy": s.get("accuracy"),
+                "total": s.get("total"),
+                "correct": s.get("correct"),
+                "avg_move": s.get("avg_move"),
+            }
+
+    try:
+        portfolio_value = float(account.get("portfolio_value", 0) or 0)
+    except (TypeError, ValueError):
+        portfolio_value = 0.0
+    try:
+        cash = float(account.get("cash", 0) or 0)
+    except (TypeError, ValueError):
+        cash = 0.0
+    try:
+        equity = float(account.get("equity", 0) or 0)
+        last_equity = float(account.get("last_equity", 0) or 0)
+        day_pl = round(equity - last_equity, 2) if last_equity else 0.0
+        day_pl_pct = round((day_pl / last_equity) * 100, 2) if last_equity else 0.0
+    except (TypeError, ValueError):
+        day_pl = day_pl_pct = 0.0
+
+    return jsonify({
+        "portfolio_value": round(portfolio_value, 2),
+        "cash": round(cash, 2),
+        "day_pl": day_pl,
+        "day_pl_pct": day_pl_pct,
+        "positions": positions,
+        "recent_trades": trades[:20],
+        "track_record": flag_stats,
+        "as_of": datetime.utcnow().isoformat() + "Z",
+    })
 
 @app.route("/run", methods=["POST"])
 @require_auth
