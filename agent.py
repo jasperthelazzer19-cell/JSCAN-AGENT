@@ -17,6 +17,7 @@ from flask import Flask, render_template_string, request, jsonify
 import anthropic
 import sendgrid
 from sendgrid.helpers.mail import Mail
+import stripe
 import yfinance as yf
 
 # ─── CONFIG ───────────────────────────────────────────────
@@ -35,7 +36,12 @@ DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 ADMIN_API_KEY   = os.environ.get("ADMIN_API_KEY", "")
 UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://jscan-agent.up.railway.app")
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 DB_PATH = "/app/data/agent.db"
 MAX_WORKERS = 2
@@ -171,6 +177,67 @@ def portfolio_link(email):
     if not key:
         return ""
     return f"{JSCAN_BASE_URL}/?key={key}#portfolio"
+
+def mark_paid(email):
+    """Promote a subscriber to paid; create a free-tier-equivalent row if they
+    paid via Stripe without first signing up. Returns (premium_key, was_already_paid)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None, False
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT paid FROM subscribers WHERE email=?", (email,))
+    row = c.fetchone()
+    was_already_paid = bool(row and row[0])
+    c.execute("""
+        INSERT INTO subscribers (email, stocks, active, paid)
+        VALUES (?, ?, 1, 1)
+        ON CONFLICT(email) DO UPDATE SET paid=1, active=1
+    """, (email, json.dumps(["ALL"])))
+    conn.commit()
+    conn.close()
+    return ensure_premium_key(email), was_already_paid
+
+def mark_unpaid(email):
+    """Subscription canceled — drop them to free tier but keep the row so they
+    still receive the daily brief."""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE subscribers SET paid=0 WHERE email=?", (email,))
+    conn.commit()
+    conn.close()
+
+def send_welcome_email(email, premium_key):
+    if not SENDGRID_KEY or not FROM_EMAIL:
+        print(f"  Skipping welcome email — SENDGRID_KEY or FROM_EMAIL not set")
+        return
+    portfolio_url = f"{JSCAN_BASE_URL}/?key={premium_key}#portfolio" if premium_key else ""
+    cta = (
+        f'<div style="text-align:center;margin:24px 0">'
+        f'<a href="{portfolio_url}" style="background:#00ff88;color:#000;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">View AI Portfolio →</a>'
+        f'</div>'
+    ) if portfolio_url else ""
+    html = f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e0e0e0">
+  <div style="max-width:600px;margin:0 auto;padding:32px 16px">
+    <div style="text-align:center;margin-bottom:24px">
+      <div style="font-size:28px;font-weight:800;color:#00ff88;letter-spacing:-1px">JSCAN</div>
+    </div>
+    <h2 style="color:#00ff88;margin:0 0 12px">Welcome to JSCAN Premium</h2>
+    <p style="color:#ccc;line-height:1.6">Thanks for subscribing. Your $5/month unlocks the full daily brief — every signal's thesis, sector breakdowns, and live access to the AI Portfolio.</p>
+    {cta}
+    <p style="color:#666;font-size:12px;margin-top:32px">Manage or cancel anytime through the Stripe link in your receipt email.</p>
+  </div>
+</body></html>"""
+    try:
+        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_KEY)
+        sg.send(Mail(from_email=FROM_EMAIL, to_emails=email, subject="Welcome to JSCAN Premium", html_content=html))
+        print(f"  Welcome email sent to {email}")
+    except Exception as e:
+        print(f"  Welcome email error for {email}: {e}")
 
 # ─── EMAIL VALIDATION + RATE LIMITING ─────────────────────
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -1841,6 +1908,54 @@ def unsubscribe():
 <p>{email} will no longer receive JSCAN briefs.</p>
 <p style="color:#555;font-size:13px">Changed your mind? Resubscribe at <a href="{PUBLIC_BASE_URL}" style="color:#00ff88">{PUBLIC_BASE_URL}</a></p>
 </body></html>"""
+
+@app.route("/webhooks/stripe", methods=["POST"])
+def stripe_webhook():
+    """Stripe sends events here on payment + cancellation. Verifies the
+    signature, then promotes/demotes the matching subscriber row."""
+    if not STRIPE_WEBHOOK_SECRET:
+        print("  Stripe webhook hit but STRIPE_WEBHOOK_SECRET not configured")
+        return jsonify({"error": "stripe webhook not configured"}), 500
+    payload = request.get_data()
+    sig = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError) as e:
+        print(f"  Stripe webhook bad signature: {e}")
+        return jsonify({"error": "bad signature"}), 400
+
+    et = event["type"]
+    obj = event["data"]["object"]
+
+    if et == "checkout.session.completed":
+        email = (obj.get("customer_details") or {}).get("email") or obj.get("customer_email")
+        if not email:
+            print("  Stripe checkout.session.completed missing email — ignoring")
+        else:
+            try:
+                key, already_paid = mark_paid(email)
+                if not already_paid:
+                    send_welcome_email(email, key)
+                print(f"  Stripe: {email} marked paid ({'renewal' if already_paid else 'new'})")
+            except Exception as e:
+                print(f"  Stripe paid-handling error for {email}: {e}")
+
+    elif et == "customer.subscription.deleted":
+        email = None
+        cust_id = obj.get("customer")
+        if cust_id:
+            try:
+                cust = stripe.Customer.retrieve(cust_id)
+                email = cust.get("email")
+            except Exception as e:
+                print(f"  Stripe customer fetch error for {cust_id}: {e}")
+        if email:
+            mark_unpaid(email)
+            print(f"  Stripe: {email} marked unpaid (subscription canceled)")
+        else:
+            print(f"  Stripe subscription.deleted but no email resolvable for customer {cust_id}")
+
+    return jsonify({"received": True}), 200
 
 @app.route("/api/accuracy", methods=["GET", "OPTIONS"])
 def api_accuracy():

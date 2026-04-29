@@ -3,5 +3,6 @@ requests
 anthropic
 sendgrid
 schedule
+stripe
 tweepy
 yfinance
