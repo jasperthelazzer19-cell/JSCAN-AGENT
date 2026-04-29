@@ -1493,6 +1493,182 @@ def run_marketing(analyses):
 
     print(f"[{datetime.utcnow()}] Marketing done.")
 
+# ─── WEEKLY REPORT ────────────────────────────────────────
+def get_week_calls(days_back=7):
+    """All calls + their 1d outcomes from the past N days."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = (datetime.utcnow().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    c.execute("""
+        SELECT ca.symbol, ca.date, ca.flag, ca.price, ca.thesis,
+               cr.price_change_pct, cr.outcome
+        FROM calls ca
+        LEFT JOIN call_results cr ON ca.id = cr.call_id AND cr.days_later = 1
+        WHERE ca.date >= ?
+        ORDER BY ca.created_at DESC
+    """, (cutoff,))
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"symbol": r[0], "date": r[1], "flag": r[2], "price": r[3],
+         "thesis": r[4], "change_pct": r[5], "outcome": r[6]}
+        for r in rows
+    ]
+
+def build_weekly_report(week_calls, account, email=None, paid=False):
+    today = datetime.utcnow().strftime("%A, %B %d, %Y")
+    by_flag = {"GREEN": 0, "RED": 0, "YELLOW": 0}
+    for c in week_calls:
+        by_flag[c["flag"]] = by_flag.get(c["flag"], 0) + 1
+    total = sum(by_flag.values())
+
+    scored = [c for c in week_calls if c["change_pct"] is not None]
+    correct = sum(1 for c in scored if c["outcome"] == "correct")
+    accuracy = round((correct / len(scored)) * 100, 1) if scored else None
+
+    best = sorted(scored, key=lambda x: x["change_pct"], reverse=True)[:5]
+    worst = sorted(scored, key=lambda x: x["change_pct"])[:5]
+
+    portfolio_val = account.get("portfolio_value", 0)
+    try:
+        portfolio_val_f = float(portfolio_val)
+    except (TypeError, ValueError):
+        portfolio_val_f = 0.0
+
+    unsub = unsubscribe_link(email)
+    unsub_html = f'<div style="text-align:center;color:#444;font-size:11px;margin-top:8px"><a href="{unsub}" style="color:#666;text-decoration:underline">Unsubscribe</a></div>' if unsub else ""
+
+    portfolio_url = portfolio_link(email) if paid else ""
+    portfolio_cta = (
+        f'<div style="text-align:center;margin:20px 0"><a href="{portfolio_url}" '
+        f'style="display:inline-block;background:#00ff88;color:#000;font-weight:700;'
+        f'padding:11px 24px;border-radius:8px;text-decoration:none;font-size:13px">'
+        f'View AI Portfolio →</a></div>'
+        if portfolio_url else
+        f'<div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:10px;padding:18px;text-align:center;margin:20px 0">'
+        f'<div style="color:#00cc66;font-weight:700;font-size:14px;margin-bottom:6px">Want full reasoning + AI Portfolio access?</div>'
+        f'<div style="color:#888;font-size:12px;margin-bottom:14px">See every signal\'s thesis, the agent\'s live positions, and conviction levels.</div>'
+        f'<a href="{PUBLIC_BASE_URL}" style="background:#00ff88;color:#000;font-weight:700;padding:10px 22px;border-radius:8px;text-decoration:none;font-size:13px">Upgrade — $10/month</a>'
+        f'</div>'
+    )
+
+    def row_for_call(c):
+        chg = c["change_pct"]
+        chg_str = f"+{chg:.2f}%" if chg and chg >= 0 else (f"{chg:.2f}%" if chg else "—")
+        chg_color = "#00cc66" if chg and chg >= 0 else ("#ff4444" if chg else "#555")
+        return (
+            f'<tr style="border-bottom:1px solid #1a1a1a">'
+            f'<td style="padding:10px 14px;color:#fff;font-weight:700">{c["symbol"]}</td>'
+            f'<td style="padding:10px 14px;color:#666;font-size:12px">{c["date"]}</td>'
+            f'<td style="padding:10px 14px">{action_badge(c["flag"])}</td>'
+            f'<td style="padding:10px 14px;color:{chg_color};font-weight:600;text-align:right">{chg_str}</td>'
+            f'</tr>'
+        )
+
+    best_rows = "".join(row_for_call(c) for c in best) or '<tr><td colspan="4" style="padding:20px;color:#444;text-align:center">No scored calls yet</td></tr>'
+    worst_rows = "".join(row_for_call(c) for c in worst) or '<tr><td colspan="4" style="padding:20px;color:#444;text-align:center">No scored calls yet</td></tr>'
+
+    accuracy_html = (
+        f'<div style="font-size:32px;font-weight:800;color:#00ff88">{accuracy}%</div>'
+        f'<div style="color:#666;font-size:12px;margin-top:4px">{correct} of {len(scored)} 1-day calls correct</div>'
+        if accuracy is not None else
+        '<div style="color:#555;font-size:14px">Not enough scored calls yet</div>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="background:#0a0a0a;color:#e0e0e0;font-family:'Helvetica Neue',Arial,sans-serif;margin:0;padding:0">
+  <div style="max-width:680px;margin:0 auto;padding:32px 20px">
+    <div style="border-bottom:1px solid #1c1c1c;padding-bottom:18px;margin-bottom:24px">
+      <div style="font-size:22px;font-weight:800;color:#00ff88;letter-spacing:-0.5px">📊 JSCAN Weekly Recap</div>
+      <div style="color:#555;font-size:13px;margin-top:4px">{today}</div>
+    </div>
+
+    <div style="display:flex;gap:10px;margin-bottom:22px">
+      <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;padding:14px 16px;flex:1">
+        <div style="font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Signals This Week</div>
+        <div style="font-size:24px;font-weight:700;color:#fff">{total}</div>
+        <div style="font-size:11px;color:#666;margin-top:4px">{by_flag.get('GREEN',0)} BUY · {by_flag.get('RED',0)} SELL · {by_flag.get('YELLOW',0)} WATCH</div>
+      </div>
+      <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;padding:14px 16px;flex:1">
+        <div style="font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Accuracy</div>
+        {accuracy_html}
+      </div>
+      <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;padding:14px 16px;flex:1">
+        <div style="font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Paper Portfolio</div>
+        <div style="font-size:24px;font-weight:700;color:#00ff88">${portfolio_val_f:,.0f}</div>
+      </div>
+    </div>
+
+    <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;overflow:hidden;margin-bottom:18px">
+      <div style="padding:14px 18px;border-bottom:1px solid #1c1c1c;font-size:13px;color:#00cc66;text-transform:uppercase;letter-spacing:1px;font-weight:700">🟢 Best Calls</div>
+      <table style="width:100%;border-collapse:collapse">{best_rows}</table>
+    </div>
+
+    <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;overflow:hidden;margin-bottom:18px">
+      <div style="padding:14px 18px;border-bottom:1px solid #1c1c1c;font-size:13px;color:#ff4444;text-transform:uppercase;letter-spacing:1px;font-weight:700">🔴 Worst Calls</div>
+      <table style="width:100%;border-collapse:collapse">{worst_rows}</table>
+    </div>
+
+    {portfolio_cta}
+
+    <div style="color:#333;font-size:12px;text-align:center;padding-top:14px;border-top:1px solid #1a1a1a">
+      JSCAN AI Agent · Weekly Recap · Paper trading only · Not financial advice
+    </div>
+    {unsub_html}
+  </div>
+</body>
+</html>"""
+
+def run_weekly_report():
+    """Friday post-close email summarizing the week's signals + accuracy + portfolio.
+    Sent to all active subscribers (free + paid)."""
+    if datetime.utcnow().weekday() != 4:  # safety: Friday only
+        print(f"[{datetime.utcnow()}] Skipping weekly report — not Friday")
+        return
+    print(f"[{datetime.utcnow()}] Running weekly report...")
+
+    # Score yesterday's calls first so the recap reflects the latest data
+    score_past_calls()
+
+    week_calls = get_week_calls(days_back=7)
+    if not week_calls:
+        print("  No calls this week — skipping weekly report")
+        return
+
+    account = get_alpaca_account()
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT email, paid FROM subscribers WHERE active=1")
+    subscribers = c.fetchall()
+    conn.close()
+
+    if not subscribers:
+        print("  No active subscribers")
+        return
+
+    sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_KEY)
+    sent = 0
+    for email, paid in subscribers:
+        try:
+            if paid:
+                ensure_premium_key(email)
+            html = build_weekly_report(week_calls, account, email=email, paid=bool(paid))
+            message = Mail(
+                from_email=FROM_EMAIL,
+                to_emails=email,
+                subject=f"JSCAN Weekly Recap — {datetime.utcnow().strftime('%b %d')}",
+                html_content=html
+            )
+            sg.send(message)
+            sent += 1
+        except Exception as e:
+            print(f"  Weekly email error for {email}: {e}")
+
+    print(f"[{datetime.utcnow()}] Weekly report done — {sent}/{len(subscribers)} emails sent")
+
 # ─── FLASK ROUTES ─────────────────────────────────────────
 SIGNUP_HTML = """<!DOCTYPE html>
 <html>
@@ -1974,7 +2150,11 @@ if __name__ == "__main__":
     print("JSCAN Agent starting...")
     print(f"Watching {len(WATCHLIST)} stocks")
 
-    schedule.every().day.at("14:00").do(run_agent)
+    # Tue–Fri analysis runs at 14:00 UTC (~7am PT, ~10am ET — pre-market)
+    for day in ["tuesday", "wednesday", "thursday", "friday"]:
+        getattr(schedule.every(), day).at("14:00").do(run_agent)
+    # Friday weekly recap at 21:30 UTC (~4:30pm ET — after market close)
+    schedule.every().friday.at("21:30").do(run_weekly_report)
 
     def run_schedule():
         while True:
