@@ -935,6 +935,20 @@ def parse_analysis(text):
     return result
 
 # ─── EMAIL BUILDER ────────────────────────────────────────
+def flag_to_action(flag):
+    """User-facing label for a flag. GREEN→BUY, RED→SELL, YELLOW→WATCH."""
+    return {"GREEN": "BUY", "RED": "SELL", "YELLOW": "WATCH"}.get(flag, flag)
+
+def action_badge(flag):
+    """Outlined pill showing the action (BUY/SELL/WATCH) in the flag color."""
+    color = {"GREEN": "#00cc66", "RED": "#ff4444", "YELLOW": "#f0c040"}.get(flag, "#888")
+    label = flag_to_action(flag)
+    return (
+        f'<span style="display:inline-block;padding:3px 10px;'
+        f'border:1px solid {color};color:{color};border-radius:4px;'
+        f'font-weight:700;font-size:11px;letter-spacing:0.5px">{label}</span>'
+    )
+
 def build_email(analyses, account, email=None):
     today = datetime.utcnow().strftime("%A, %B %d, %Y")
     portfolio_val = account.get("portfolio_value", "N/A")
@@ -965,7 +979,7 @@ def build_email(analyses, account, email=None):
           <td style="padding:14px 16px;color:#aaa;font-size:13px">{a['name']}</td>
           <td style="padding:14px 16px;color:#fff;font-weight:600">${a['price']}</td>
           <td style="padding:14px 16px;color:{chg_color};font-weight:600">{chg_str}</td>
-          <td style="padding:14px 16px;color:{fc};font-weight:700;font-size:13px">{a['flag']}</td>
+          <td style="padding:14px 16px">{action_badge(a['flag'])}</td>
           <td style="padding:14px 16px;color:#ccc;font-size:13px">{a['verdict']}</td>
         </tr>"""
 
@@ -996,8 +1010,8 @@ def build_email(analyses, account, email=None):
         </div>
       </div>
     </div>
-    {"<div style='background:#0d0d0d;border:1px solid #00cc6633;border-radius:10px;padding:20px;margin-bottom:20px'><div style='font-size:13px;color:#00cc66;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:14px'>🟢 Green Signals — Bullish</div>" + "".join([f"<div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1a1a1a'><span style='font-weight:700;color:#fff'>{a['symbol']}</span> <span style='color:#aaa;font-size:13px'>({a['name']})</span> — <span style='color:#ccc;font-size:13px'>{a['verdict']}</span></div>" for a in green]) + "</div>" if green else ""}
-    {"<div style='background:#0d0d0d;border:1px solid #ff444433;border-radius:10px;padding:20px;margin-bottom:20px'><div style='font-size:13px;color:#ff4444;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:14px'>🔴 Red Signals — Bearish</div>" + "".join([f"<div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1a1a1a'><span style='font-weight:700;color:#fff'>{a['symbol']}</span> <span style='color:#aaa;font-size:13px'>({a['name']})</span> — <span style='color:#ccc;font-size:13px'>{a['verdict']}</span></div>" for a in red]) + "</div>" if red else ""}
+    {"<div style='background:#0d0d0d;border:1px solid #00cc6633;border-radius:10px;padding:20px;margin-bottom:20px'><div style='font-size:13px;color:#00cc66;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:14px'>🟢 Buy Signals</div>" + "".join([f"<div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1a1a1a'><span style='font-weight:700;color:#fff'>{a['symbol']}</span> <span style='color:#aaa;font-size:13px'>({a['name']})</span> — <span style='color:#ccc;font-size:13px'>{a['verdict']}</span></div>" for a in green]) + "</div>" if green else ""}
+    {"<div style='background:#0d0d0d;border:1px solid #ff444433;border-radius:10px;padding:20px;margin-bottom:20px'><div style='font-size:13px;color:#ff4444;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:14px'>🔴 Sell Signals</div>" + "".join([f"<div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1a1a1a'><span style='font-weight:700;color:#fff'>{a['symbol']}</span> <span style='color:#aaa;font-size:13px'>({a['name']})</span> — <span style='color:#ccc;font-size:13px'>{a['verdict']}</span></div>" for a in red]) + "</div>" if red else ""}
     <div style="background:#0d0d0d;border:1px solid #1c1c1c;border-radius:10px;overflow:hidden;margin-bottom:28px">
       <div style="padding:16px 20px;border-bottom:1px solid #1c1c1c">
         <div style="font-size:13px;color:#555;text-transform:uppercase;letter-spacing:1px;font-weight:600">Full Watchlist Analysis</div>
@@ -1008,7 +1022,7 @@ def build_email(analyses, account, email=None):
           <th style="padding:10px 16px;text-align:left;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px">Company</th>
           <th style="padding:10px 16px;text-align:left;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px">Price</th>
           <th style="padding:10px 16px;text-align:left;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px">Change</th>
-          <th style="padding:10px 16px;text-align:left;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px">Signal</th>
+          <th style="padding:10px 16px;text-align:left;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px">Action</th>
           <th style="padding:10px 16px;text-align:left;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px">Verdict</th>
         </tr>
         {rows}
@@ -1051,7 +1065,7 @@ def build_free_email(analyses, account, email=None):
           <td style="padding:14px 16px;color:#aaa;font-size:13px">{a['name']}</td>
           <td style="padding:14px 16px;color:#fff;font-weight:600">${a['price']}</td>
           <td style="padding:14px 16px;color:{chg_color};font-weight:600">{chg_str}</td>
-          <td style="padding:14px 16px;color:{fc};font-weight:700;font-size:13px">{a['flag']}</td>
+          <td style="padding:14px 16px">{action_badge(a['flag'])}</td>
         </tr>"""
 
     html = f"""<!DOCTYPE html>
@@ -1079,7 +1093,7 @@ def build_free_email(analyses, account, email=None):
             <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Name</th>
             <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Price</th>
             <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Change</th>
-            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Signal</th>
+            <th style="padding:10px 16px;text-align:left;color:#555;font-size:11px;font-weight:600;text-transform:uppercase">Action</th>
           </tr>
         </thead>
         <tbody>{rows}</tbody>
@@ -1276,7 +1290,7 @@ def run_agent(symbols=None, force=False):
             message = Mail(
                 from_email=FROM_EMAIL,
                 to_emails=email,
-                subject=f"JSCAN Daily Brief - {datetime.utcnow().strftime('%b %d')} | {len([a for a in user_analyses if a['flag']=='GREEN'])} GREEN {len([a for a in user_analyses if a['flag']=='RED'])} RED",
+                subject=f"JSCAN Daily Brief - {datetime.utcnow().strftime('%b %d')} | {len([a for a in user_analyses if a['flag']=='GREEN'])} BUY {len([a for a in user_analyses if a['flag']=='RED'])} SELL",
                 html_content=user_html
             )
             sg.send(message)
@@ -1354,9 +1368,9 @@ def generate_marketing_post(analyses):
 
     prompt = f"""Write a compelling tweet about today's AI stock signal. Include the signup URL as plain text.
 
-Signal: {best['symbol']} flagged {flag} at ${best['price']}
+Signal: {best['symbol']} flagged {flag_to_action(flag)} at ${best['price']}
 Thesis: {best.get('verdict','')[:120]}
-Today: {len(greens)} GREEN, {len(reds)} RED out of {len(analyses)} stocks analyzed
+Today: {len(greens)} BUY, {len(reds)} SELL out of {len(analyses)} stocks analyzed
 {accuracy_line}
 URL: jscan-agent.up.railway.app
 
@@ -1383,13 +1397,13 @@ def generate_discord_post(analyses):
     today = datetime.utcnow().strftime("%B %d, %Y")
     msg = f"**JSCAN Daily Signals - {today}**\n\n"
     msg += f"Analyzed **{len(analyses)} stocks** today\n"
-    msg += f"**{len(greens)} GREEN** | {len(yellows)} YELLOW | **{len(reds)} RED**\n\n"
+    msg += f"**{len(greens)} BUY** | {len(yellows)} WATCH | **{len(reds)} SELL**\n\n"
     if greens:
-        msg += "**TOP BULLISH SIGNALS:**\n"
+        msg += "**TOP BUY SIGNALS:**\n"
         for c in greens[:3]:
             msg += f"🟢 **{c['symbol']}** @ ${c['price']} — {c.get('verdict','')[:80]}...\n"
     if reds:
-        msg += "\n**TOP BEARISH SIGNALS:**\n"
+        msg += "\n**TOP SELL SIGNALS:**\n"
         for c in reds[:3]:
             msg += f"🔴 **{c['symbol']}** @ ${c['price']} — {c.get('verdict','')[:80]}...\n"
     msg += f"\nFull analysis + signup: jscan-agent.up.railway.app"
@@ -1647,7 +1661,7 @@ def dashboard():
             tr_html += f"""
             <div style="margin-bottom:16px">
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-                    <span style="color:{fc};font-weight:700">{flag}</span>
+                    <span style="color:{fc};font-weight:700">{flag_to_action(flag)}</span>
                     <span style="color:#fff;font-weight:600">{stats.get('accuracy',0)}% accurate</span>
                 </div>
                 <div style="background:#1a1a1a;border-radius:4px;height:8px;overflow:hidden">
@@ -1668,7 +1682,7 @@ def dashboard():
         <tr style="border-bottom:1px solid #111">
             <td style="padding:10px 16px;color:#fff;font-weight:700">{call['symbol']}</td>
             <td style="padding:10px 16px;color:#555;font-size:.85em">{call['date']}</td>
-            <td style="padding:10px 16px;color:{fc};font-weight:700">{call['flag']}</td>
+            <td style="padding:10px 16px">{action_badge(call['flag'])}</td>
             <td style="padding:10px 16px;color:#aaa">${call['price']}</td>
             <td style="padding:10px 16px;color:{chg_color};font-weight:600">{chg_str}</td>
             <td style="padding:10px 16px">{outcome_badge(call['outcome'])}</td>
@@ -1764,7 +1778,7 @@ th{{padding:10px 16px;text-align:left;font-size:.68em;color:#444;text-transform:
     <div class="section-header">📋 Recent Calls (last 50)</div>
     <div style="overflow-x:auto">
       <table>
-        <tr><th>Symbol</th><th>Date</th><th>Flag</th><th>Price</th><th>1d Change</th><th>Outcome</th><th>Thesis</th></tr>
+        <tr><th>Symbol</th><th>Date</th><th>Action</th><th>Price</th><th>1d Change</th><th>Outcome</th><th>Thesis</th></tr>
         {calls_html}
       </table>
     </div>
