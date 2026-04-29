@@ -544,24 +544,33 @@ def score_past_calls():
     scored = 0
     today = datetime.utcnow().date()
 
+    skipped_future = skipped_parse = skipped_noprice = 0
+
     for days_later in [1, 7, 30]:
         c.execute("""
             SELECT id, symbol, flag, price, date FROM calls
-            WHERE id NOT IN (SELECT call_id FROM call_results WHERE days_later = ?)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM call_results
+                WHERE call_results.call_id = calls.id
+                  AND call_results.days_later = ?
+            )
         """, (days_later,))
         rows = c.fetchall()
+        print(f"    horizon={days_later}d: {len(rows)} unscored candidates")
 
         for call_id, symbol, flag, price_then, call_date_str in rows:
             try:
                 cd = datetime.strptime(call_date_str, "%Y-%m-%d").date()
             except (TypeError, ValueError):
+                skipped_parse += 1
                 continue
             outcome_date = cd + timedelta(days=days_later)
-            if outcome_date >= today:
-                # Outcome window hasn't fully closed yet — wait for tomorrow's run
+            if outcome_date > today:
+                skipped_future += 1
                 continue
             price_now = get_close_on_or_after(symbol, outcome_date.strftime("%Y-%m-%d"))
             if price_now is None or not price_then:
+                skipped_noprice += 1
                 continue
             change_pct = round(((price_now - price_then) / price_then) * 100, 2)
 
@@ -580,7 +589,7 @@ def score_past_calls():
 
     conn.commit()
     conn.close()
-    print(f"  Scored {scored} past calls")
+    print(f"  Scored {scored} past calls (skipped: future={skipped_future}, parse={skipped_parse}, no_price={skipped_noprice})")
     return scored
 
 def get_track_record():
