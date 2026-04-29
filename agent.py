@@ -1177,7 +1177,7 @@ def build_free_email(analyses, account, email=None):
     <div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:20px">
       <div style="color:#00cc66;font-weight:700;font-size:15px;margin-bottom:8px">Want full analysis + thesis for all 100 stocks?</div>
       <div style="color:#888;font-size:13px;margin-bottom:16px">Upgrade to see why each signal was called, sector breakdowns, and full AI reasoning.</div>
-      <a href="https://jscan-agent.up.railway.app" style="background:#00ff88;color:#000;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">Upgrade — $10/month</a>
+      <a href="https://buy.stripe.com/4gM9AUa0f4XPcic8ne5AQ00" style="background:#00ff88;color:#000;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">Upgrade — $5/month</a>
     </div>
     <div style="text-align:center;color:#333;font-size:12px">
       JSCAN AI Agent · Paper trading only · Not financial advice
@@ -1557,7 +1557,7 @@ def build_weekly_report(week_calls, account, email=None, paid=False):
         f'<div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:10px;padding:18px;text-align:center;margin:20px 0">'
         f'<div style="color:#00cc66;font-weight:700;font-size:14px;margin-bottom:6px">Want full reasoning + AI Portfolio access?</div>'
         f'<div style="color:#888;font-size:12px;margin-bottom:14px">See every signal\'s thesis, the agent\'s live positions, and conviction levels.</div>'
-        f'<a href="{PUBLIC_BASE_URL}" style="background:#00ff88;color:#000;font-weight:700;padding:10px 22px;border-radius:8px;text-decoration:none;font-size:13px">Upgrade — $10/month</a>'
+        f'<a href="https://buy.stripe.com/4gM9AUa0f4XPcic8ne5AQ00" style="background:#00ff88;color:#000;font-weight:700;padding:10px 22px;border-radius:8px;text-decoration:none;font-size:13px">Upgrade — $5/month</a>'
         f'</div>'
     )
 
