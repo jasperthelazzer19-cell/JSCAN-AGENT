@@ -2453,29 +2453,58 @@ def stripe_webhook():
 @app.route("/api/accuracy", methods=["GET", "OPTIONS"])
 def api_accuracy():
     """Public endpoint exposing the agent's track record for jscan.tech's
-    AI Accuracy tab. Returns last 100 scored calls + summary stats."""
+    AI Accuracy tab. Returns scored calls in the requested window + summary stats.
+
+    Query params:
+      window=all  (default) — every scored call ever, capped at 500 rows
+      window=30d            — calls made in the last 30 calendar days
+      window=7d             — calls made in the last 7 calendar days
+    """
     if request.method == "OPTIONS":
         return "", 204
+    window = (request.args.get("window") or "all").lower()
+    if window not in ("all", "30d", "7d"):
+        window = "all"
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""
-            SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
-            FROM calls ca
-            JOIN call_results cr ON ca.id = cr.call_id
-            WHERE cr.days_later = 1
-            ORDER BY ca.date DESC, ca.id DESC
-            LIMIT 100
-        """)
+        if window == "30d":
+            cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+            c.execute("""
+                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+                FROM calls ca
+                JOIN call_results cr ON ca.id = cr.call_id
+                WHERE cr.days_later = 1 AND ca.date >= ?
+                ORDER BY ca.date DESC, ca.id DESC
+                LIMIT 500
+            """, (cutoff,))
+        elif window == "7d":
+            cutoff = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+            c.execute("""
+                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+                FROM calls ca
+                JOIN call_results cr ON ca.id = cr.call_id
+                WHERE cr.days_later = 1 AND ca.date >= ?
+                ORDER BY ca.date DESC, ca.id DESC
+                LIMIT 500
+            """, (cutoff,))
+        else:
+            c.execute("""
+                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+                FROM calls ca
+                JOIN call_results cr ON ca.id = cr.call_id
+                WHERE cr.days_later = 1
+                ORDER BY ca.date DESC, ca.id DESC
+                LIMIT 500
+            """)
         rows = c.fetchall()
         conn.close()
         calls = [{
             "symbol": r[0], "flag": r[1], "price": r[2],
             "date": r[3], "outcome": r[4], "change_pct": r[5],
         } for r in rows]
-        # Directional accuracy excludes WATCH/neutral. WATCH calls aren't predictions
-        # — they're "no call made" — so counting them as wrong (or right) misrepresents
-        # the system. Frontend should display correct/(correct+incorrect) as the headline.
+        # Directional accuracy excludes WATCH/neutral. WATCH is the system declining
+        # to commit a direction, so it should not count for or against accuracy.
         correct = sum(1 for cc in calls if cc["outcome"] == "correct")
         incorrect = sum(1 for cc in calls if cc["outcome"] == "incorrect")
         watch = sum(1 for cc in calls if cc["outcome"] == "neutral" or cc.get("flag") == "YELLOW")
@@ -2483,6 +2512,7 @@ def api_accuracy():
         accuracy = round(correct / active * 100, 1) if active else None
         return jsonify({
             "calls": calls,
+            "window": window,
             "correct": correct,
             "incorrect": incorrect,
             "watch": watch,
@@ -2492,7 +2522,7 @@ def api_accuracy():
         })
     except Exception as e:
         return jsonify({
-            "calls": [], "correct": 0, "incorrect": 0, "watch": 0,
+            "calls": [], "window": window, "correct": 0, "incorrect": 0, "watch": 0,
             "total_active": 0, "total": 0, "accuracy": None, "error": str(e)
         }), 500
 
