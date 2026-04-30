@@ -2473,10 +2473,28 @@ def api_accuracy():
             "symbol": r[0], "flag": r[1], "price": r[2],
             "date": r[3], "outcome": r[4], "change_pct": r[5],
         } for r in rows]
+        # Directional accuracy excludes WATCH/neutral. WATCH calls aren't predictions
+        # — they're "no call made" — so counting them as wrong (or right) misrepresents
+        # the system. Frontend should display correct/(correct+incorrect) as the headline.
         correct = sum(1 for cc in calls if cc["outcome"] == "correct")
-        return jsonify({"calls": calls, "correct": correct, "total": len(calls)})
+        incorrect = sum(1 for cc in calls if cc["outcome"] == "incorrect")
+        watch = sum(1 for cc in calls if cc["outcome"] == "neutral" or cc.get("flag") == "YELLOW")
+        active = correct + incorrect
+        accuracy = round(correct / active * 100, 1) if active else None
+        return jsonify({
+            "calls": calls,
+            "correct": correct,
+            "incorrect": incorrect,
+            "watch": watch,
+            "total_active": active,
+            "total": len(calls),
+            "accuracy": accuracy,
+        })
     except Exception as e:
-        return jsonify({"calls": [], "correct": 0, "total": 0, "error": str(e)}), 500
+        return jsonify({
+            "calls": [], "correct": 0, "incorrect": 0, "watch": 0,
+            "total_active": 0, "total": 0, "accuracy": None, "error": str(e)
+        }), 500
 
 @app.route("/api/portfolio", methods=["GET", "OPTIONS"])
 def api_portfolio():
