@@ -45,6 +45,11 @@ if STRIPE_SECRET_KEY:
 
 DB_PATH = "/app/data/agent.db"
 MAX_WORKERS = 2
+# Public-facing v1.0 launch date. Calls before this were made under the v0
+# system (pre Tier 1-3 self-improvement loop, pre scoring fix). The dashboard
+# can present a "Since v1.0" view alongside All Time so we can lead with the
+# post-launch number for marketing without hiding history.
+V1_LAUNCH_DATE = "2026-05-01"
 
 # Module-level singleton — thread-safe, reused across all agent calls
 ANTHROPIC = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -2463,12 +2468,21 @@ def api_accuracy():
     if request.method == "OPTIONS":
         return "", 204
     window = (request.args.get("window") or "all").lower()
-    if window not in ("all", "30d", "7d"):
+    if window not in ("all", "30d", "7d", "v1"):
         window = "all"
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        if window == "30d":
+        if window == "v1":
+            c.execute("""
+                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+                FROM calls ca
+                JOIN call_results cr ON ca.id = cr.call_id
+                WHERE cr.days_later = 1 AND ca.date >= ?
+                ORDER BY ca.date DESC, ca.id DESC
+                LIMIT 500
+            """, (V1_LAUNCH_DATE,))
+        elif window == "30d":
             cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
             c.execute("""
                 SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
@@ -2649,6 +2663,90 @@ def api_meta_memo():
     if not memo:
         return jsonify({"memo": None})
     return jsonify({"memo": memo})
+
+@app.route("/audit-scoring", methods=["POST"])
+@require_auth
+def audit_scoring():
+    """Re-fetch yfinance closes for a sample of scored rows and check whether the
+    stored outcome matches what it should be. Reports mismatches but does NOT
+    modify anything. The cleanup endpoint is a separate explicit action.
+
+    Query params:
+      sample=N      sample size, default 50, max 200 (yfinance is slow)
+      days_later=1  which horizon to audit, default 1
+    """
+    try:
+        sample = max(1, min(200, int(request.args.get("sample", 50))))
+    except (TypeError, ValueError):
+        sample = 50
+    try:
+        horizon = int(request.args.get("days_later", 1))
+    except (TypeError, ValueError):
+        horizon = 1
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT cr.id, ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+        FROM call_results cr JOIN calls ca ON cr.call_id = ca.id
+        WHERE cr.days_later = ?
+        ORDER BY RANDOM()
+        LIMIT ?
+    """, (horizon, sample))
+    rows = c.fetchall()
+    conn.close()
+
+    mismatches = []
+    confirmed = 0
+    skipped = 0
+    for cr_id, symbol, flag, price_then, call_date_str, stored_outcome, stored_chg in rows:
+        try:
+            cd = datetime.strptime(call_date_str, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        outcome_date = cd + timedelta(days=horizon)
+        actual_close = get_close_on_or_after(symbol, outcome_date.strftime("%Y-%m-%d"))
+        if actual_close is None or not price_then:
+            skipped += 1
+            continue
+        actual_chg = round(((actual_close - price_then) / price_then) * 100, 2)
+        if flag == "GREEN":
+            expected = "correct" if actual_chg > 0.5 else "incorrect" if actual_chg < -0.5 else "neutral"
+        elif flag == "RED":
+            expected = "correct" if actual_chg < -0.5 else "incorrect" if actual_chg > 0.5 else "neutral"
+        else:
+            expected = "neutral"
+        chg_drift = round(abs((stored_chg or 0) - actual_chg), 2)
+        if stored_outcome != expected or chg_drift > 0.5:
+            mismatches.append({
+                "call_result_id": cr_id,
+                "symbol": symbol,
+                "flag": flag,
+                "call_date": call_date_str,
+                "stored_outcome": stored_outcome,
+                "expected_outcome": expected,
+                "stored_change_pct": stored_chg,
+                "actual_change_pct": actual_chg,
+                "change_drift": chg_drift,
+            })
+        else:
+            confirmed += 1
+
+    return jsonify({
+        "horizon": horizon,
+        "sampled": len(rows),
+        "confirmed_correct": confirmed,
+        "skipped_no_data": skipped,
+        "mismatches": len(mismatches),
+        "mismatch_rate_pct": round(len(mismatches) / max(1, len(rows) - skipped) * 100, 1),
+        "details": mismatches[:50],
+        "interpretation": (
+            "if mismatch_rate_pct is < 5%, scoring is clean and there is no contamination to clean up. "
+            "if 5-20%, investigate the patterns in details — there may be a class of dates or symbols affected. "
+            "if > 20%, scoring has a real bug and the affected rows should be deleted before drawing conclusions."
+        ),
+    })
 
 @app.route("/status")
 def status():
