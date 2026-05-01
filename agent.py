@@ -2470,47 +2470,27 @@ def api_accuracy():
     window = (request.args.get("window") or "all").lower()
     if window not in ("all", "30d", "7d", "v1"):
         window = "all"
+    # Hard floor on V1_LAUNCH_DATE — pre-launch rows stay in the DB but never
+    # surface to the public dashboard. Every window selects the LATER of its
+    # own cutoff and the launch date.
+    if window == "30d":
+        local_cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+    elif window == "7d":
+        local_cutoff = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    else:  # all and v1
+        local_cutoff = "1970-01-01"
+    cutoff = max(local_cutoff, V1_LAUNCH_DATE)
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        if window == "v1":
-            c.execute("""
-                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
-                FROM calls ca
-                JOIN call_results cr ON ca.id = cr.call_id
-                WHERE cr.days_later = 1 AND ca.date >= ?
-                ORDER BY ca.date DESC, ca.id DESC
-                LIMIT 500
-            """, (V1_LAUNCH_DATE,))
-        elif window == "30d":
-            cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
-            c.execute("""
-                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
-                FROM calls ca
-                JOIN call_results cr ON ca.id = cr.call_id
-                WHERE cr.days_later = 1 AND ca.date >= ?
-                ORDER BY ca.date DESC, ca.id DESC
-                LIMIT 500
-            """, (cutoff,))
-        elif window == "7d":
-            cutoff = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
-            c.execute("""
-                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
-                FROM calls ca
-                JOIN call_results cr ON ca.id = cr.call_id
-                WHERE cr.days_later = 1 AND ca.date >= ?
-                ORDER BY ca.date DESC, ca.id DESC
-                LIMIT 500
-            """, (cutoff,))
-        else:
-            c.execute("""
-                SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
-                FROM calls ca
-                JOIN call_results cr ON ca.id = cr.call_id
-                WHERE cr.days_later = 1
-                ORDER BY ca.date DESC, ca.id DESC
-                LIMIT 500
-            """)
+        c.execute("""
+            SELECT ca.symbol, ca.flag, ca.price, ca.date, cr.outcome, cr.price_change_pct
+            FROM calls ca
+            JOIN call_results cr ON ca.id = cr.call_id
+            WHERE cr.days_later = 1 AND ca.date >= ?
+            ORDER BY ca.date DESC, ca.id DESC
+            LIMIT 500
+        """, (cutoff,))
         rows = c.fetchall()
         conn.close()
         calls = [{
