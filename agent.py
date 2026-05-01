@@ -49,7 +49,7 @@ MAX_WORKERS = 2
 # system (pre Tier 1-3 self-improvement loop, pre scoring fix). The dashboard
 # can present a "Since v1.0" view alongside All Time so we can lead with the
 # post-launch number for marketing without hiding history.
-V1_LAUNCH_DATE = "2026-05-01"
+V1_LAUNCH_DATE = "2026-04-30"
 
 # Module-level singleton — thread-safe, reused across all agent calls
 ANTHROPIC = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -2623,6 +2623,18 @@ def api_portfolio():
 def trigger_run():
     threading.Thread(target=lambda: run_agent(force=True), daemon=True).start()
     return jsonify({"success": True, "message": "Agent started in background"})
+
+@app.route("/launch-run", methods=["GET", "POST"])
+def launch_run():
+    """One-shot v1.0 launch trigger. The scheduled run got killed by an
+    earlier deploy and the user does not have terminal access to curl /run.
+    Token-gated so random visitors cannot trigger expensive Claude runs.
+    Remove this endpoint once the user has confirmed the daily schedule
+    is stable."""
+    if request.args.get("token") != "jscan-launch-2026":
+        return jsonify({"error": "invalid token"}), 401
+    threading.Thread(target=lambda: run_agent(force=True), daemon=True).start()
+    return jsonify({"success": True, "message": "Agent run started in background. Email will arrive in ~10-15 min."})
 
 @app.route("/meta-evolve", methods=["POST"])
 @require_auth
